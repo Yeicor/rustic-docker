@@ -18,11 +18,16 @@ jobs:
       id-token: write
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - registry: ghcr.io
+            username: ${{ github.actor }}
+            password: ${{ secrets.GITHUB_TOKEN }}
             image_name: ${{ github.repository }}
           - registry: ""  # Docker Hub
+            username: yeicor
+            password: ${{ secrets.DOCKERHUB_TOKEN }}
             image_name: Yeicor/rustic
 
     steps:
@@ -45,7 +50,7 @@ jobs:
         with:
           registry: ${{ matrix.registry }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ matrix.password }}
 
       - name: Extract Docker metadata
         id: meta
