@@ -33,6 +33,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: 'rustic-rs/rustic'
+          # TODO: matrix for each available tag, stable, latest, etc.
 
       - name: Install cosign
         uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
@@ -72,7 +73,7 @@ jobs:
           context: .
           push: true
           build-args: RUST_VERSION=slim-bookworm
-          tags: ${{ steps.meta.outputs.tags }}
+          # tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
