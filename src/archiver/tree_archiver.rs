@@ -63,7 +63,7 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> TreeArchiver<BE, I> {
                 // save tree
                 trace!("finishing {path:?}");
                 let id = self.backup_tree(&path, parent)?;
-                node.set_subtree(id);
+                node.subtree = Some(id);
 
                 // go back to parent dir
                 self.tree = tree;
@@ -122,14 +122,14 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> TreeArchiver<BE, I> {
         }
 
         if !self.index.has_tree(&id) {
-            self.tree_packer.add(&chunk, &id)?;
+            self.tree_packer.add(chunk.into(), id)?;
         }
         Ok(id)
     }
 
     pub fn finalize(mut self, parent_tree: Option<Id>) -> Result<(Id, SnapshotSummary)> {
         let parent = match parent_tree {
-            None => ParentResult::NotMatched,
+            None => ParentResult::NotFound,
             Some(id) => ParentResult::Matched(id),
         };
         let id = self.backup_tree(&PathBuf::new(), parent)?;

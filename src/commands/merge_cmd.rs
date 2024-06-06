@@ -1,20 +1,23 @@
 use anyhow::Result;
 use chrono::Local;
-use clap::{AppSettings, Parser};
+use clap::Parser;
 use log::*;
 
 use crate::backend::{DecryptWriteBackend, FileType};
 use crate::blob::{merge_trees, BlobType, Node, Packer, Tree};
 use crate::index::{IndexBackend, Indexer, ReadIndex};
-use crate::repofile::{PathList, SnapshotFile, SnapshotFilter, SnapshotOptions};
+use crate::repofile::{PathList, SnapshotFile, SnapshotOptions};
 use crate::repository::OpenRepository;
 
 use super::helpers::{progress_counter, progress_spinner};
-use super::rustic_config::RusticConfig;
+use super::Config;
 
 #[derive(Default, Parser)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 pub(super) struct Opts {
+    /// Snapshots to merge. If none is given, use filter options to filter from all snapshots.
+    #[clap(value_name = "ID")]
+    ids: Vec<String>,
+
     /// Output generated snapshot in json format
     #[clap(long)]
     json: bool,
@@ -23,30 +26,21 @@ pub(super) struct Opts {
     #[clap(long)]
     delete: bool,
 
-    #[clap(flatten)]
+    #[clap(flatten, next_help_heading = "Snapshot options")]
     snap_opts: SnapshotOptions,
-
-    #[clap(flatten, help_heading = "SNAPSHOT FILTER OPTIONS")]
-    filter: SnapshotFilter,
-
-    /// Snapshots to merge. If none is given, use filter to filter from all snapshots.
-    #[clap(value_name = "ID")]
-    ids: Vec<String>,
 }
 
 pub(super) fn execute(
     repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
+    config: Config,
+    opts: Opts,
     command: String,
 ) -> Result<()> {
     let now = Local::now();
-
     let be = &repo.dbe;
-    config_file.merge_into("snapshot-filter", &mut opts.filter)?;
 
     let snapshots = match opts.ids.is_empty() {
-        true => SnapshotFile::all_from_backend(be, &opts.filter)?,
+        true => SnapshotFile::all_from_backend(be, &config.snapshot_filter)?,
         false => SnapshotFile::from_ids(be, &opts.ids)?,
     };
     let index = IndexBackend::only_full_trees(&be.clone(), progress_counter(""))?;
@@ -83,7 +77,7 @@ pub(super) fn execute(
         let (chunk, new_id) = tree.serialize()?;
         let size = u64::try_from(chunk.len())?;
         if !index.has_tree(&new_id) {
-            packer.add(&chunk, &new_id)?;
+            packer.add(chunk.into(), new_id)?;
         }
         Ok((new_id, size))
     };

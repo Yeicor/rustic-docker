@@ -4,23 +4,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
-use super::{progress_counter, RusticConfig};
-use crate::backend::{LocalDestination, LocalSource, LocalSourceOptions, ReadSourceEntry};
+use super::{progress_counter, Config};
+use crate::backend::{
+    LocalDestination, LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions,
+    ReadSourceEntry,
+};
 use crate::blob::{Node, NodeStreamer, NodeType, Tree};
 use crate::commands::helpers::progress_spinner;
 use crate::crypto::hash;
 use crate::index::{IndexBackend, ReadIndex};
-use crate::repofile::{SnapshotFile, SnapshotFilter};
+use crate::repofile::SnapshotFile;
 use crate::repository::OpenRepository;
 
 #[derive(Parser)]
 pub(super) struct Opts {
-    #[clap(flatten)]
-    ignore_opts: LocalSourceOptions,
-
-    #[clap(flatten, help_heading = "SNAPSHOT FILTER OPTIONS (when using latest)")]
-    filter: SnapshotFilter,
-
     /// Reference snapshot/path
     #[clap(value_name = "SNAPSHOT1[:PATH1]")]
     snap1: String,
@@ -36,13 +33,12 @@ pub(super) struct Opts {
     /// don't check for different file contents
     #[clap(long)]
     no_content: bool,
+
+    #[clap(flatten)]
+    ignore_opts: LocalSourceFilterOptions,
 }
 
-pub(super) fn execute(
-    repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
+pub(super) fn execute(repo: OpenRepository, config: Config, opts: Opts) -> Result<()> {
     let be = &repo.dbe;
     let (id1, path1) = arg_to_snap_path(&opts.snap1, "");
     let (id2, path2) = arg_to_snap_path(&opts.snap2, path1);
@@ -71,10 +67,13 @@ pub(super) fn execute(
         }
         (Some(id1), None) => {
             // diff between snapshot and local path
-            config_file.merge_into("snapshot-filter", &mut opts.filter)?;
-
             let p = progress_spinner("getting snapshot...");
-            let snap1 = SnapshotFile::from_str(be, id1, |sn| sn.matches(&opts.filter), p.clone())?;
+            let snap1 = SnapshotFile::from_str(
+                be,
+                id1,
+                |sn| sn.matches(&config.snapshot_filter),
+                p.clone(),
+            )?;
             p.finish();
 
             let index = IndexBackend::new(be, progress_counter(""))?;
@@ -85,7 +84,12 @@ pub(super) fn execute(
                 .metadata()
                 .with_context(|| format!("Error accessing {path2:?}"))?
                 .is_dir();
-            let src = LocalSource::new(opts.ignore_opts, &[&path2])?.map(|item| {
+            let src = LocalSource::new(
+                LocalSourceSaveOptions::default(),
+                opts.ignore_opts,
+                &[&path2],
+            )?
+            .map(|item| {
                 let ReadSourceEntry { path, node, .. } = item?;
                 let path = if is_dir {
                     // remove given path prefix for dirs as local path
@@ -128,7 +132,7 @@ fn identical_content_local(
     path: &Path,
     node: &Node,
 ) -> Result<bool> {
-    let mut open_file = match local.get_matching_file(path, *node.meta().size()) {
+    let mut open_file = match local.get_matching_file(path, node.meta.size) {
         Some(file) => file,
         None => return Ok(false),
     };
@@ -182,18 +186,18 @@ fn diff(
                 let path = &i1.0;
                 let node1 = &i1.1;
                 let node2 = &i2.1;
-                match node1.node_type() {
-                    tpe if tpe != node2.node_type() => println!("T    {path:?}"), // type was changed
+                match &node1.node_type {
+                    tpe if tpe != &node2.node_type => println!("T    {path:?}"), // type was changed
                     NodeType::File if !no_content && !file_identical(path, node1, node2)? => {
                         println!("M    {path:?}");
                     }
-                    NodeType::File if metadata && node1.meta() != node2.meta() => {
+                    NodeType::File if metadata && node1.meta != node2.meta => {
                         println!("U    {path:?}");
                     }
                     NodeType::Symlink { linktarget } => {
                         if let NodeType::Symlink {
                             linktarget: linktarget2,
-                        } = node2.node_type()
+                        } = &node2.node_type
                         {
                             if *linktarget != *linktarget2 {
                                 println!("U    {path:?}");

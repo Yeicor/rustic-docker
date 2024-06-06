@@ -4,16 +4,14 @@ use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, Utc};
-use clap::{AppSettings, Parser};
-use derive_getters::Dissolve;
+use clap::Parser;
 use ignore::{DirEntry, WalkBuilder};
 use log::*;
 use rayon::ThreadPoolBuilder;
 
-use super::rustic_config::RusticConfig;
-use super::{bytes, progress_bytes, progress_counter, warm_up_wait};
+use super::{bytes, progress_bytes, progress_counter, warm_up_wait, Config};
 use crate::backend::{DecryptReadBackend, FileType, LocalDestination};
 use crate::blob::{Node, NodeStreamer, NodeType, Tree, TreeStreamerOptions};
 use crate::commands::helpers::progress_spinner;
@@ -24,20 +22,17 @@ use crate::repofile::{SnapshotFile, SnapshotFilter};
 use crate::repository::OpenRepository;
 
 #[derive(Parser)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 pub(super) struct Opts {
-    #[clap(flatten, help_heading = "SNAPSHOT FILTER OPTIONS (when using latest)")]
-    filter: SnapshotFilter,
+    /// Snapshot/path to restore
+    #[clap(value_name = "SNAPSHOT[:PATH]")]
+    snap: String,
 
-    /// Dry-run: don't restore, only show what would be done
-    #[clap(long, short = 'n')]
-    dry_run: bool,
-
-    #[clap(flatten)]
-    streamer_opts: TreeStreamerOptions,
+    /// Restore destination
+    #[clap(value_name = "DESTINATION")]
+    dest: String,
 
     /// Remove all files/dirs in destination which are not contained in snapshot.
-    /// WARNING: Use with care, maybe first try this first with --dry-run?
+    /// WARNING: Use with care, maybe first try this with --dry-run?
     #[clap(long)]
     delete: bool,
 
@@ -46,51 +41,33 @@ pub(super) struct Opts {
     numeric_id: bool,
 
     /// Don't restore ownership (user/group)
-    #[clap(long, conflicts_with = "numeric-id")]
+    #[clap(long, conflicts_with = "numeric_id")]
     no_ownership: bool,
-
-    /// Warm up needed data pack files by only requesting them without processing
-    #[clap(long)]
-    warm_up: bool,
 
     /// Always read and verify existing files (don't trust correct modification time and file size)
     #[clap(long)]
     verify_existing: bool,
 
-    /// Warm up needed data pack files by running the command with %id replaced by pack id
-    #[clap(long, conflicts_with = "warm-up")]
-    warm_up_command: Option<String>,
+    #[clap(flatten)]
+    streamer_opts: TreeStreamerOptions,
 
-    /// Duration (e.g. 10m) to wait after warm up before doing the actual restore
-    #[clap(long, value_name = "DURATION", conflicts_with = "dry-run")]
-    warm_up_wait: Option<humantime::Duration>,
-
-    /// Snapshot/path to restore
-    #[clap(value_name = "SNAPSHOT[:PATH]")]
-    snap: String,
-
-    /// Restore destination
-    #[clap(value_name = "DESTINATION")]
-    dest: String,
+    #[clap(
+        flatten,
+        next_help_heading = "Snapshot filter options (when using latest)"
+    )]
+    filter: SnapshotFilter,
 }
 
-pub(super) fn execute(
-    repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
+pub(super) fn execute(repo: OpenRepository, config: Config, opts: Opts) -> Result<()> {
     let be = &repo.dbe;
-    config_file.merge_into("snapshot-filter", &mut opts.filter)?;
-
-    if let Some(command) = &opts.warm_up_command {
-        if !command.contains("%id") {
-            bail!("warm-up command must contain %id!");
-        }
-        info!("using warm-up command {command}");
-    }
 
     let (id, path) = opts.snap.split_once(':').unwrap_or((&opts.snap, ""));
-    let snap = SnapshotFile::from_str(be, id, |sn| sn.matches(&opts.filter), progress_counter(""))?;
+    let snap = SnapshotFile::from_str(
+        be,
+        id,
+        |sn| sn.matches(&config.snapshot_filter),
+        progress_counter(""),
+    )?;
 
     let index = IndexBackend::new(be, progress_counter(""))?;
     let node = Tree::node_from_path(&index, snap.tree, Path::new(path))?;
@@ -98,7 +75,7 @@ pub(super) fn execute(
     let dest = LocalDestination::new(&opts.dest, true, !node.is_dir())?;
 
     let p = progress_spinner("collecting file information...");
-    let (file_infos, stats) = allocate_and_collect(&dest, index.clone(), &node, &opts)?;
+    let (file_infos, stats) = allocate_and_collect(&dest, index.clone(), &node, &config, &opts)?;
     p.finish();
 
     let fs = stats.file;
@@ -123,13 +100,17 @@ pub(super) fn execute(
     if file_infos.restore_size == 0 {
         info!("all file contents are fine.");
     } else {
-        warm_up_wait(&repo, file_infos.to_packs().into_iter(), !opts.dry_run)?;
-        if !opts.dry_run {
+        warm_up_wait(
+            &repo,
+            file_infos.to_packs().into_iter(),
+            !config.global.dry_run,
+        )?;
+        if !config.global.dry_run {
             restore_contents(be, &dest, file_infos)?;
         }
     }
 
-    if !opts.dry_run {
+    if !config.global.dry_run {
         let p = progress_spinner("setting metadata...");
         restore_metadata(&dest, index, &node, &opts)?;
         p.finish();
@@ -159,6 +140,7 @@ fn allocate_and_collect(
     dest: &LocalDestination,
     index: impl IndexedBackend + Unpin,
     node: &Node,
+    config: &Config,
     opts: &Opts,
 ) -> Result<(FileInfos, RestoreStats)> {
     let dest_path = Path::new(&opts.dest);
@@ -182,7 +164,7 @@ fn allocate_and_collect(
         }
         match (
             opts.delete,
-            opts.dry_run,
+            config.global.dry_run,
             entry.file_type().unwrap().is_dir(),
         ) {
             (true, true, true) => {
@@ -219,7 +201,7 @@ fn allocate_and_collect(
     };
 
     let mut process_node = |path: &PathBuf, node: &Node, exists: bool| -> Result<_> {
-        match node.node_type() {
+        match node.node_type {
             NodeType::Dir => {
                 if exists {
                     stats.dir.modify += 1;
@@ -227,7 +209,7 @@ fn allocate_and_collect(
                 } else {
                     stats.dir.restore += 1;
                     debug!("to restore: {path:?}");
-                    if !opts.dry_run {
+                    if !config.global.dry_run {
                         dest.create_dir(path)
                             .with_context(|| format!("error creating {path:?}"))?;
                     }
@@ -256,7 +238,7 @@ fn allocate_and_collect(
                     (true, AddFileResult::New(size) | AddFileResult::Modify(size)) => {
                         stats.file.modify += 1;
                         debug!("to modify: {path:?}");
-                        if !opts.dry_run {
+                        if !config.global.dry_run {
                             // set the right file size
                             dest.set_length(path, size)
                                 .with_context(|| format!("error setting length for {path:?}"))?;
@@ -265,7 +247,7 @@ fn allocate_and_collect(
                     (false, AddFileResult::New(size) | AddFileResult::Modify(size)) => {
                         stats.file.restore += 1;
                         debug!("to restore: {path:?}");
-                        if !opts.dry_run {
+                        if !config.global.dry_run {
                             // create the file as it doesn't exist
                             dest.set_length(path, size)
                                 .with_context(|| format!("error creating {path:?}"))?;
@@ -343,7 +325,12 @@ fn restore_contents(
     dest: &LocalDestination,
     file_infos: FileInfos,
 ) -> Result<()> {
-    let (filenames, restore_info, total_size, _) = file_infos.dissolve();
+    let FileInfos {
+        names: filenames,
+        r: restore_info,
+        restore_size: total_size,
+        ..
+    } = file_infos;
 
     let p = progress_bytes("restoring file contents...");
     p.set_length(total_size);
@@ -417,7 +404,7 @@ fn restore_metadata(
     let mut node_streamer = NodeStreamer::new_with_glob(index, node, opts.streamer_opts.clone())?;
     let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.next().transpose()? {
-        match node.node_type() {
+        match node.node_type {
             NodeType::Dir => {
                 // set metadata for all non-parent paths in stack
                 while let Some((stackpath, _)) = dir_stack.last() {
@@ -450,17 +437,17 @@ fn set_metadata(dest: &LocalDestination, path: &PathBuf, node: &Node, opts: &Opt
     match (opts.no_ownership, opts.numeric_id) {
         (true, _) => {}
         (false, true) => dest
-            .set_uid_gid(path, node.meta())
+            .set_uid_gid(path, &node.meta)
             .unwrap_or_else(|_| warn!("restore {:?}: setting UID/GID failed.", path)),
         (false, false) => dest
-            .set_user_group(path, node.meta())
+            .set_user_group(path, &node.meta)
             .unwrap_or_else(|_| warn!("restore {:?}: setting User/Group failed.", path)),
     }
     dest.set_permission(path, node)
         .unwrap_or_else(|_| warn!("restore {:?}: chmod failed.", path));
     dest.set_extended_attributes(path, &node.meta.extended_attributes)
         .unwrap_or_else(|_| warn!("restore {:?}: setting extended attributes failed.", path));
-    dest.set_times(path, node.meta())
+    dest.set_times(path, &node.meta)
         .unwrap_or_else(|_| warn!("restore {:?}: setting file times failed.", path));
 }
 
@@ -468,7 +455,7 @@ fn set_metadata(dest: &LocalDestination, path: &PathBuf, node: &Node, opts: &Opt
 /// 1) pack ID,
 /// 2) blob within this pack
 /// 3) the actual files and position of this blob within those
-#[derive(Debug, Dissolve)]
+#[derive(Debug)]
 struct FileInfos {
     names: Filenames,
     r: RestoreInfo,
@@ -530,8 +517,7 @@ impl FileInfos {
         index: &impl IndexedBackend,
         ignore_mtime: bool,
     ) -> Result<AddFileResult> {
-        let mut open_file = dest.get_matching_file(&name, *file.meta().size());
-        let file_meta = file.meta();
+        let mut open_file = dest.get_matching_file(&name, file.meta.size);
 
         if !ignore_mtime {
             if let Some(meta) = open_file.as_ref().map(|f| f.metadata()).transpose()? {
@@ -540,10 +526,10 @@ impl FileInfos {
                     .modified()
                     .ok()
                     .map(|t| DateTime::<Utc>::from(t).with_timezone(&Local));
-                if meta.len() == file_meta.size && mtime == file_meta.mtime {
+                if meta.len() == file.meta.size && mtime == file.meta.mtime {
                     // File exists with fitting mtime => we suspect this file is ok!
                     debug!("file {name:?} exists with suitable size and mtime, accepting it!");
-                    self.matched_size += file_meta.size;
+                    self.matched_size += file.meta.size;
                     return Ok(AddFileResult::Existing);
                 }
             }
@@ -558,9 +544,9 @@ impl FileInfos {
                 .get_data(id)
                 .ok_or_else(|| anyhow!("did not find id {} in index", id))?;
             let bl = BlobLocation {
-                offset: *ie.offset(),
-                length: *ie.length(),
-                uncompressed_length: *ie.uncompressed_length(),
+                offset: ie.offset,
+                length: ie.length,
+                uncompressed_length: ie.uncompressed_length,
             };
             let length = bl.data_length();
 
@@ -573,7 +559,7 @@ impl FileInfos {
                 None => false,
             };
 
-            let pack = self.r.entry(*ie.pack()).or_insert_with(HashMap::new);
+            let pack = self.r.entry(ie.pack).or_insert_with(HashMap::new);
             let blob_location = pack.entry(bl).or_insert_with(Vec::new);
             blob_location.push(FileLocation {
                 file_idx,

@@ -1,37 +1,31 @@
 use anyhow::Result;
 use chrono::{Duration, Local};
-use clap::{AppSettings, Parser};
+use clap::Parser;
 
-use super::{progress_counter, RusticConfig};
+use super::{progress_counter, Config};
 use crate::backend::{DecryptWriteBackend, FileType};
 use crate::id::Id;
-use crate::repofile::{DeleteOption, SnapshotFile, SnapshotFilter, StringList};
+use crate::repofile::{DeleteOption, SnapshotFile, StringList};
 use crate::repository::OpenRepository;
 
 #[derive(Parser)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 pub(super) struct Opts {
-    /// Don't change any snapshot, only show which would be modified
-    #[clap(long, short = 'n')]
-    dry_run: bool,
-
-    #[clap(
-        flatten,
-        help_heading = "SNAPSHOT FILTER OPTIONS (if no snapshot is given)"
-    )]
-    filter: SnapshotFilter,
+    /// Snapshots to change tags. If none is given, use filter to filter from all
+    /// snapshots.
+    #[clap(value_name = "ID")]
+    ids: Vec<String>,
 
     /// Tags to add (can be specified multiple times)
     #[clap(
         long,
         value_name = "TAG[,TAG,..]",
         conflicts_with = "remove",
-        help_heading = "TAG OPTIONS"
+        help_heading = "Tag options"
     )]
     add: Vec<StringList>,
 
     /// Tags to remove (can be specified multiple times)
-    #[clap(long, value_name = "TAG[,TAG,..]", help_heading = "TAG OPTIONS")]
+    #[clap(long, value_name = "TAG[,TAG,..]", help_heading = "Tag options")]
     remove: Vec<StringList>,
 
     /// Tag list to set (can be specified multiple times)
@@ -39,46 +33,36 @@ pub(super) struct Opts {
         long,
         value_name = "TAG[,TAG,..]",
         conflicts_with = "remove",
-        help_heading = "TAG OPTIONS"
+        help_heading = "Tag options"
     )]
     set: Vec<StringList>,
 
     /// Remove any delete mark
     #[clap(
         long,
-        conflicts_with_all = &["set-delete-never", "set-delete-after"], 
-        help_heading = "DELETE MARK OPTIONS"
+        conflicts_with_all = &["set_delete_never", "set_delete_after"], 
+        help_heading = "Delete mark options"
     )]
     remove_delete: bool,
 
     /// Mark snapshot as uneraseable
     #[clap(
         long,
-        conflicts_with = "set-delete-after",
-        help_heading = "DELETE MARK OPTIONS"
+        conflicts_with = "set_delete_after",
+        help_heading = "Delete mark options"
     )]
     set_delete_never: bool,
 
     /// Mark snapshot to be deleted after given duration (e.g. 10d)
-    #[clap(long, value_name = "DURATION", help_heading = "DELETE MARK OPTIONS")]
+    #[clap(long, value_name = "DURATION", help_heading = "Delete mark options")]
     set_delete_after: Option<humantime::Duration>,
-
-    /// Snapshots to change tags. If none is given, use filter to filter from all
-    /// snapshots.
-    #[clap(value_name = "ID")]
-    ids: Vec<String>,
 }
 
-pub(super) fn execute(
-    repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
-    config_file.merge_into("snapshot-filter", &mut opts.filter)?;
+pub(super) fn execute(repo: OpenRepository, config: Config, opts: Opts) -> Result<()> {
     let be = &repo.dbe;
 
     let snapshots = match opts.ids.is_empty() {
-        true => SnapshotFile::all_from_backend(be, &opts.filter)?,
+        true => SnapshotFile::all_from_backend(be, &config.snapshot_filter)?,
         false => SnapshotFile::from_ids(be, &opts.ids)?,
     };
 
@@ -103,7 +87,7 @@ pub(super) fn execute(
         snap.id = Id::default();
     }
 
-    match (old_snap_ids.is_empty(), opts.dry_run) {
+    match (old_snap_ids.is_empty(), config.global.dry_run) {
         (true, _) => println!("no snapshot changed."),
         (false, true) => {
             println!("would have modified the following snapshots:\n {old_snap_ids:?}");

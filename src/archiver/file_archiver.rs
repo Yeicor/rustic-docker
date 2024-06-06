@@ -2,11 +2,10 @@ use std::io::Read;
 
 use anyhow::{anyhow, Result};
 use indicatif::ProgressBar;
-use rayon::prelude::*;
 
 use crate::backend::{DecryptWriteBackend, ReadSourceOpen};
 use crate::blob::{BlobType, Node, NodeType, Packer, PackerStats};
-use crate::chunker::ChunkIter;
+use crate::chunker::{ChunkIter, Rabin64};
 use crate::crypto::hash;
 use crate::index::{IndexedBackend, SharedIndexer};
 use crate::repofile::ConfigFile;
@@ -17,7 +16,7 @@ use super::{ItemWithParent, ParentResult, TreeItem, TreeType};
 pub struct FileArchiver<BE: DecryptWriteBackend, I: IndexedBackend> {
     index: I,
     data_packer: Packer<BE>,
-    poly: u64,
+    rabin: Rabin64,
 }
 
 impl<BE: DecryptWriteBackend, I: IndexedBackend> FileArchiver<BE, I> {
@@ -31,10 +30,11 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> FileArchiver<BE, I> {
             config,
             index.total_size(BlobType::Data),
         )?;
+        let rabin = Rabin64::new_with_polynom(6, poly);
         Ok(Self {
             index,
             data_packer,
-            poly,
+            rabin,
         })
     }
 
@@ -51,7 +51,7 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> FileArchiver<BE, I> {
                     let size = node.meta.size;
                     p.inc(size);
                     (node, size)
-                } else if let NodeType::File = node.node_type() {
+                } else if let NodeType::File = node.node_type {
                     let r = open.ok_or(anyhow!("cannot open file"))?.open()?;
                     self.backup_reader(r, node, p)?
                 } else {
@@ -68,30 +68,25 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> FileArchiver<BE, I> {
         node: Node,
         p: ProgressBar,
     ) -> Result<(Node, u64)> {
-        let mut chunks: Vec<_> = ChunkIter::new(r, *node.meta().size() as usize, self.poly)
-            .enumerate() // see below
-            .par_bridge()
-            .map(|(num, chunk)| {
+        let chunks: Vec<_> = ChunkIter::new(r, node.meta.size as usize, self.rabin.clone())
+            .map(|chunk| {
                 let chunk = chunk?;
                 let id = hash(&chunk);
                 let size = chunk.len() as u64;
 
                 if !self.index.has_data(&id) {
-                    self.data_packer.add(&chunk, &id)?;
+                    self.data_packer.add(chunk.into(), id)?;
                 }
                 p.inc(size);
-                Ok((num, id, size))
+                Ok((id, size))
             })
             .collect::<Result<_>>()?;
 
-        // As par_bridge doesn't guarantee to keep the order, we sort by the enumeration
-        chunks.par_sort_unstable_by_key(|x| x.0);
-
-        let filesize = chunks.iter().map(|x| x.2).sum();
-        let content = chunks.into_iter().map(|x| x.1).collect();
+        let filesize = chunks.iter().map(|x| x.1).sum();
+        let content = chunks.into_iter().map(|x| x.0).collect();
 
         let mut node = node;
-        node.set_content(content);
+        node.content = Some(content);
         Ok((node, filesize))
     }
 

@@ -3,16 +3,17 @@ use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use chrono::Local;
-use clap::{AppSettings, Parser};
+use clap::Parser;
 use log::*;
 use merge::Merge;
 use path_dedot::ParseDot;
 use serde::Deserialize;
-use toml::Value;
 
-use super::{bytes, progress_bytes, progress_counter, RusticConfig};
+use super::{bytes, progress_bytes, progress_counter, Config};
 use crate::archiver::Archiver;
-use crate::backend::{DryRunBackend, LocalSource, LocalSourceOptions, StdinSource};
+use crate::backend::{
+    DryRunBackend, LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions, StdinSource,
+};
 use crate::index::IndexBackend;
 use crate::repofile::{
     PathList, SnapshotFile, SnapshotGroup, SnapshotGroupCriterion, SnapshotOptions,
@@ -20,39 +21,63 @@ use crate::repofile::{
 use crate::repository::OpenRepository;
 
 #[derive(Clone, Default, Parser, Deserialize, Merge)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-pub(super) struct Opts {
-    /// Output generated snapshot in json format
-    #[clap(long)]
-    #[merge(strategy = merge::bool::overwrite_false)]
-    json: bool,
-
-    /// Do not upload or write any data, just show what would be done
-    #[clap(long, short = 'n')]
-    #[merge(strategy = merge::bool::overwrite_false)]
-    dry_run: bool,
+// Note: using cli_sources, sources and source within this strict is a hack to support serde(deny_unknown_fields)
+// for deserializing the backup options from TOML
+// Unfortunately we cannot work with nested flattened structures, see
+// https://github.com/serde-rs/serde/issues/1547
+// A drawback is that a wrongly set "source(s) = ..." won't get correct error handling and need to be manually checked, see below.
+pub struct Opts {
+    /// Backup source (can be specified multiple times), use - for stdin. If no source is given, uses all
+    /// sources defined in the config file
+    #[clap(value_name = "SOURCE")]
+    #[merge(skip)]
+    #[serde(skip)]
+    cli_sources: Vec<String>,
 
     /// Group snapshots by any combination of host,label,paths,tags to find a suitable parent (default: host,label,paths)
-    #[clap(long, short = 'g', value_name = "CRITERION")]
+    #[clap(
+        long,
+        short = 'g',
+        value_name = "CRITERION",
+        help_heading = "Options for parent processing"
+    )]
     group_by: Option<SnapshotGroupCriterion>,
 
     /// Snapshot to use as parent
-    #[clap(long, value_name = "SNAPSHOT", conflicts_with = "force")]
+    #[clap(
+        long,
+        value_name = "SNAPSHOT",
+        conflicts_with = "force",
+        help_heading = "Options for parent processing"
+    )]
     parent: Option<String>,
 
     /// Use no parent, read all files
-    #[clap(long, short, conflicts_with = "parent")]
+    #[clap(
+        long,
+        short,
+        conflicts_with = "parent",
+        help_heading = "Options for parent processing"
+    )]
     #[merge(strategy = merge::bool::overwrite_false)]
     force: bool,
 
     /// Ignore ctime changes when checking for modified files
-    #[clap(long, conflicts_with = "force")]
+    #[clap(
+        long,
+        conflicts_with = "force",
+        help_heading = "Options for parent processing"
+    )]
     #[merge(strategy = merge::bool::overwrite_false)]
     ignore_ctime: bool,
 
     /// Ignore inode number changes when checking for modified files
-    #[clap(long, conflicts_with = "force")]
+    #[clap(
+        long,
+        conflicts_with = "force",
+        help_heading = "Options for parent processing"
+    )]
     #[merge(strategy = merge::bool::overwrite_false)]
     ignore_inode: bool,
 
@@ -67,28 +92,24 @@ pub(super) struct Opts {
 
     #[clap(flatten)]
     #[serde(flatten)]
-    snap_opts: SnapshotOptions,
+    ignore_save_opts: LocalSourceSaveOptions,
 
     #[clap(flatten)]
     #[serde(flatten)]
-    ignore_opts: LocalSourceOptions,
+    ignore_filter_opts: LocalSourceFilterOptions,
 
-    /// Backup source (can be specified multiple times), use - for stdin. If no source is given, uses all
-    /// sources defined in the config file
-    #[clap(value_name = "SOURCE")]
-    #[merge(skip)]
-    #[serde(skip)]
-    cli_sources: Vec<String>,
+    #[clap(flatten, next_help_heading = "Snapshot options")]
+    #[serde(flatten)]
+    snap_opts: SnapshotOptions,
 
-    // This is a hack to support serde(deny_unknown_fields) for deserializing the backup options from TOML
-    // while still being able to use [[backup.sources]] in the config file.
-    // A drawback is that a unkowen "sources = ..." won't be bailed...
-    // Note that unfortunately we cannot work with nested flattened structures, see
-    // https://github.com/serde-rs/serde/issues/1547
+    /// Output generated snapshot in json format
+    #[clap(long)]
+    #[merge(strategy = merge::bool::overwrite_false)]
+    json: bool,
+
     #[clap(skip)]
     #[merge(skip)]
-    #[serde(rename = "sources")]
-    config_sources: Option<Value>,
+    sources: Vec<Opts>,
 
     /// Backup source, used within config file
     #[clap(skip)]
@@ -98,13 +119,24 @@ pub(super) struct Opts {
 
 pub(super) fn execute(
     repo: OpenRepository,
+    mut config: Config,
     opts: Opts,
-    config_file: RusticConfig,
     command: String,
 ) -> Result<()> {
     let time = Local::now();
 
-    let config_opts: Vec<Opts> = config_file.get("backup.sources")?;
+    // manually check for a "source" field, check is not done by serde, see above.
+    if !config.backup.source.is_empty() {
+        bail!("key \"source\" is not valid in the [backup] section!");
+    }
+
+    let config_opts = config.backup.sources;
+    config.backup.sources = Vec::new();
+
+    // manually check for a "sources" field, check is not done by serde, see above.
+    if config_opts.iter().any(|opt| !opt.sources.is_empty()) {
+        bail!("key \"sources\" is not valid in a [[backup.sources]] section!");
+    }
 
     let config_sources: Vec<_> = config_opts
         .iter()
@@ -162,10 +194,11 @@ pub(super) fn execute(
                 }
             }
         }
-        // merge "backup" section from config file, if given
-        config_file.merge_into("backup", &mut opts)?;
 
-        let be = DryRunBackend::new(repo.dbe.clone(), opts.dry_run);
+        // merge "backup" section from config file, if given
+        opts.merge(config.backup.clone());
+
+        let be = DryRunBackend::new(repo.dbe.clone(), config.global.dry_run);
         info!("starting to backup {source}...");
         let as_path = match opts.as_path {
             None => None,
@@ -222,7 +255,11 @@ pub(super) fn execute(
             let src = StdinSource::new(path.clone())?;
             archiver.archive(src, path, as_path.as_ref(), &p)?
         } else {
-            let src = LocalSource::new(opts.ignore_opts.clone(), &backup_path)?;
+            let src = LocalSource::new(
+                opts.ignore_save_opts.clone(),
+                opts.ignore_filter_opts.clone(),
+                &backup_path,
+            )?;
             archiver.archive(src, &backup_path[0], as_path.as_ref(), &p)?
         };
 

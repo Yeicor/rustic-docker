@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Result};
 use bytesize::ByteSize;
 use chrono::{DateTime, Duration, Local};
-use clap::{AppSettings, Parser};
+use clap::Parser;
 use derive_more::Add;
 use itertools::Itertools;
 use log::*;
 use rayon::prelude::*;
 
-use super::{bytes, no_progress, progress_bytes, progress_counter, warm_up_wait};
+use super::{bytes, no_progress, progress_bytes, progress_counter, warm_up_wait, Config};
 use crate::backend::{DecryptReadBackend, DecryptWriteBackend, FileType, ReadBackend};
 use crate::blob::{
     BlobType, BlobTypeMap, Initialize, NodeType, PackSizer, Repacker, Sum, TreeStreamerOnce,
@@ -24,12 +24,8 @@ use crate::repofile::{HeaderEntry, IndexBlob, IndexFile, IndexPack, SnapshotFile
 use crate::repository::OpenRepository;
 
 #[derive(Parser)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
+#[group(id = "prune_opts")]
 pub(super) struct Opts {
-    /// Don't remove anything, only show what would be done
-    #[clap(long, short = 'n')]
-    pub(crate) dry_run: bool,
-
     /// Define maximum data to repack in % of reposize or as size (e.g. '5b', '2 kB', '3M', '4TiB') or 'unlimited'
     #[clap(long, value_name = "LIMIT", default_value = "unlimited")]
     max_repack: LimitOption,
@@ -59,8 +55,12 @@ pub(super) struct Opts {
 
     /// Repack packs containing uncompressed blobs. This cannot be used with --fast-repack.
     /// Implies --max-unused=0.
-    #[clap(long, conflicts_with = "fast-repack")]
+    #[clap(long, conflicts_with = "fast_repack")]
     repack_uncompressed: bool,
+
+    /// Repack all packs. Implies --max-unused=0.
+    #[clap(long)]
+    repack_all: bool,
 
     /// Only repack packs which are cacheable [default: true for a hot/cold repository, else false]
     #[clap(long, value_name = "TRUE/FALSE")]
@@ -71,7 +71,12 @@ pub(super) struct Opts {
     no_resize: bool,
 }
 
-pub(super) fn execute(repo: OpenRepository, opts: Opts, ignore_snaps: Vec<Id>) -> Result<()> {
+pub(super) fn execute(
+    repo: OpenRepository,
+    config: Config,
+    opts: Opts,
+    ignore_snaps: Vec<Id>,
+) -> Result<()> {
     let be = &repo.dbe;
     if repo.config.version < 2 && opts.repack_uncompressed {
         bail!("--repack-uncompressed makes no sense for v1 repo!");
@@ -118,12 +123,13 @@ pub(super) fn execute(repo: OpenRepository, opts: Opts, ignore_snaps: Vec<Id>) -
         Duration::from_std(*opts.keep_delete)?,
         repack_cacheable_only,
         opts.repack_uncompressed,
+        opts.repack_all,
         &pack_sizer,
     )?;
     pruner.decide_repack(
         &opts.max_repack,
         &opts.max_unused,
-        opts.repack_uncompressed,
+        opts.repack_uncompressed || opts.repack_all,
         opts.no_resize,
         &pack_sizer,
     );
@@ -131,14 +137,16 @@ pub(super) fn execute(repo: OpenRepository, opts: Opts, ignore_snaps: Vec<Id>) -
     pruner.filter_index_files(opts.instant_delete);
     pruner.print_stats();
 
-    warm_up_wait(&repo, pruner.repack_packs().into_iter(), !opts.dry_run)?;
+    let dry_run = config.global.dry_run;
+    warm_up_wait(&repo, pruner.repack_packs().into_iter(), !dry_run)?;
 
-    if !opts.dry_run {
+    if !dry_run {
         pruner.do_prune(repo, opts)?;
     }
     Ok(())
 }
 
+#[derive(Clone)]
 enum LimitOption {
     Size(ByteSize),
     Percentage(u64),
@@ -456,6 +464,7 @@ impl Pruner {
         keep_delete: Duration,
         repack_cacheable_only: bool,
         repack_uncompressed: bool,
+        repack_all: bool,
         pack_sizer: &BlobTypeMap<PackSizer>,
     ) -> Result<()> {
         // first process all marked packs then the unmarked ones:
@@ -495,7 +504,7 @@ impl Pruner {
                             self.stats.packs.used += 1;
                             if too_young || keep_uncacheable {
                                 pack.set_todo(PackToDo::Keep, &pi, &mut self.stats);
-                            } else if to_compress {
+                            } else if to_compress || repack_all {
                                 self.repack_candidates
                                     .push((pi, ToCompress, index_num, pack_num));
                             } else if size_mismatch {
@@ -1107,13 +1116,13 @@ fn find_used_blobs(
     let mut tree_streamer = TreeStreamerOnce::new(index.clone(), snap_trees, p)?;
     while let Some(item) = tree_streamer.next().transpose()? {
         let (_, tree) = item;
-        for node in tree.nodes() {
-            match node.node_type() {
+        for node in tree.nodes {
+            match node.node_type {
                 NodeType::File => {
                     ids.extend(node.content.iter().flatten().map(|id| (*id, 0)));
                 }
                 NodeType::Dir => {
-                    ids.insert(node.subtree().unwrap(), 0);
+                    ids.insert(node.subtree.unwrap(), 0);
                 }
                 _ => {} // nothing to do
             }
