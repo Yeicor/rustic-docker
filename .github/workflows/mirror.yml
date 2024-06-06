@@ -85,7 +85,6 @@ jobs:
           echo "updatedrefs=$updated_refs" >> $GITHUB_OUTPUT
 
   trigger-docker-for-updates:
-    runs-on: ubuntu-latest
     needs: [ mirror ]
     strategy:
       matrix:
