@@ -39,6 +39,7 @@ jobs:
           rsync -a --exclude='.git' ${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
           git config --global user.name 'yeicor-mirror.yml'
           git config --global user.email 'Yeicor@users.noreply.github.com'
+          git add -v .
           git commit -am "Automated sync of original sources"
           git push
           
