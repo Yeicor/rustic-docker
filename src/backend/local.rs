@@ -1,10 +1,11 @@
 use std::fs::{self, File};
-use std::io::{copy, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use bytes::Bytes;
 use filetime::{set_file_atime, set_file_mtime, FileTime};
 use nix::sys::stat::{mknod, Mode, SFlag};
 use nix::unistd::chown;
@@ -41,6 +42,10 @@ impl LocalBackend {
 impl ReadBackend for LocalBackend {
     fn location(&self) -> &str {
         self.path.to_str().unwrap()
+    }
+
+    fn set_option(&mut self, _option: &str, _value: &str) -> Result<()> {
+        Ok(())
     }
 
     async fn list(&self, tpe: FileType) -> Result<Vec<Id>> {
@@ -99,8 +104,8 @@ impl ReadBackend for LocalBackend {
         Ok(walker.collect())
     }
 
-    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Vec<u8>> {
-        Ok(fs::read(self.path(tpe, id))?)
+    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Bytes> {
+        Ok(fs::read(self.path(tpe, id))?.into())
     }
 
     async fn read_partial(
@@ -110,12 +115,12 @@ impl ReadBackend for LocalBackend {
         _cacheable: bool,
         offset: u32,
         length: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let mut file = File::open(self.path(tpe, id))?;
         file.seek(SeekFrom::Start(offset.try_into().unwrap()))?;
         let mut vec = vec![0; length.try_into().unwrap()];
         file.read_exact(&mut vec)?;
-        Ok(vec)
+        Ok(vec.into())
     }
 }
 
@@ -131,12 +136,12 @@ impl WriteBackend for LocalBackend {
         Ok(())
     }
 
-    async fn write_file(
+    async fn write_bytes(
         &self,
         tpe: FileType,
         id: &Id,
         _cacheable: bool,
-        mut f: File,
+        buf: Bytes,
     ) -> Result<()> {
         v3!("writing tpe: {:?}, id: {}", &tpe, &id);
         let filename = self.path(tpe, id);
@@ -144,18 +149,7 @@ impl WriteBackend for LocalBackend {
             .create(true)
             .write(true)
             .open(&filename)?;
-        copy(&mut f, &mut file)?;
-        file.sync_all()?;
-        Ok(())
-    }
-
-    async fn write_bytes(&self, tpe: FileType, id: &Id, buf: Vec<u8>) -> Result<()> {
-        v3!("writing tpe: {:?}, id: {}", &tpe, &id);
-        let filename = self.path(tpe, id);
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&filename)?;
+        file.set_len(buf.len().try_into()?)?;
         file.write_all(&buf)?;
         file.sync_all()?;
         Ok(())
@@ -170,26 +164,13 @@ impl WriteBackend for LocalBackend {
 }
 
 impl LocalBackend {
-    /*
-        pub fn walker(&self) -> impl Iterator<Item = PathBuf> {
-            let path = self.path.clone();
-            WalkDir::new(path.clone())
-                .min_depth(1)
-                .into_iter()
-                .filter_map(walkdir::Result::ok)
-                .map(move |e| e.path().strip_prefix(path.clone()).unwrap().into())
-        }
+    pub fn remove_dir(&self, dirname: impl AsRef<Path>) -> Result<()> {
+        Ok(fs::remove_dir(dirname)?)
+    }
 
-        pub fn remove_dir(&self, item: impl AsRef<Path>) {
-            let dirname = self.path.join(item);
-            fs::remove_dir(&dirname).unwrap();
-        }
-
-        pub fn remove_file(&self, item: impl AsRef<Path>) {
-            let filename = self.path.join(item);
-            fs::remove_file(&filename).unwrap();
-        }
-    */
+    pub fn remove_file(&self, filename: impl AsRef<Path>) -> Result<()> {
+        Ok(fs::remove_file(&filename)?)
+    }
 
     pub fn create_dir(&self, item: impl AsRef<Path>) -> Result<()> {
         let dirname = self.path.join(item);
@@ -287,6 +268,29 @@ impl LocalBackend {
             _ => {}
         }
         Ok(())
+    }
+
+    pub fn read_at(&self, item: impl AsRef<Path>, offset: u64, length: u64) -> Result<Bytes> {
+        let filename = self.path.join(item);
+        let mut file = File::open(&filename)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut vec = vec![0; length.try_into().unwrap()];
+        file.read_exact(&mut vec).unwrap();
+        Ok(vec.into())
+    }
+
+    pub fn get_matching_file(&self, item: impl AsRef<Path>, size: u64) -> Option<File> {
+        let filename = self.path.join(item);
+        match fs::symlink_metadata(&filename) {
+            Ok(meta) => {
+                if meta.is_file() && meta.len() == size {
+                    File::open(&filename).ok()
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
     }
 
     pub fn write_at(&self, item: impl AsRef<Path>, offset: u64, data: &[u8]) -> Result<()> {

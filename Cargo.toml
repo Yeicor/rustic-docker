@@ -1,6 +1,6 @@
 [package]
 name = "rustic-rs"
-version = "0.2.3"
+version = "0.3.0"
 description = """
 fast, encrypted, deduplicated backups powered by pure Rust
 """
@@ -45,31 +45,39 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-aux = "3"
 # other dependencies
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
-tempfile = "3"
 zstd = "0.11"
 enum-map = "2"
-enum-map-derive = "0.9"
+enum-map-derive = "0.10"
+self_update = {version = "0.30", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
 # local backend
 walkdir = "2"
 ignore = "0.4"
-nix = "0.24"
+nix = "0.25"
 filetime = "0.2"
 # rest backend
 reqwest = {version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
+backoff = { version = "0.4", features = ["tokio"] }
 # rclone backend
 sha1 = "0.10"
+tempfile = "3"
 # cache
 dirs = "4"
 cachedir = "0.3"
 # commands
-clap = { version = "3", features = ["derive"] }
-rpassword = "6"
-prettytable-rs = {version = "0.8", default-features = false }
+clap = { version = "3", features = ["derive", "env"] }
+rpassword = "7"
+prettytable-rs = {version = "0.9", default-features = false }
 bytesize = "1"
-indicatif = "0.17.0-rc.10"
+indicatif = "0.17"
 path-absolutize = "3"
 gethostname = "0.2"
 humantime = "2"
 users = "0.11"
 itertools = "0.10"
+
+[dev-dependencies]
+rstest = "0.15"
+quickcheck = "1"
+quickcheck_macros = "1"

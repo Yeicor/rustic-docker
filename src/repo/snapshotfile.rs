@@ -46,7 +46,7 @@ pub struct SnapshotSummary {
     pub backup_duration: f64, // in seconds
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Derivative)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Derivative)]
 #[derivative(Default)]
 pub enum DeleteOption {
     #[derivative(Default)]
@@ -311,11 +311,11 @@ impl Ord for SnapshotFile {
 #[derive(Parser)]
 pub struct SnapshotFilter {
     /// Path list to filter (can be specified multiple times)
-    #[clap(long = "filter-paths")]
+    #[clap(long = "filter-paths", value_name = "PATH[,PATH,..]")]
     paths: Vec<StringList>,
 
     /// Tag list to filter (can be specified multiple times)
-    #[clap(long = "filter-tags")]
+    #[clap(long = "filter-tags", value_name = "TAG[,TAG,..]")]
     tags: Vec<StringList>,
 
     /// Hostname to filter (can be specified multiple times)
