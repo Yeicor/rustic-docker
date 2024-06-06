@@ -73,7 +73,7 @@ jobs:
           context: .
           push: true
           build-args: RUST_VERSION=slim-bookworm
-          # tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ matrix.image_name }}:test  # ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
