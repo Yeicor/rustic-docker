@@ -34,8 +34,6 @@ jobs:
           echo "==========="
           find $(dirname ${GITHUB_WORKSPACE})
       - uses: actions/checkout@v4   # Checkout self (to keep our custom files)
-        with:
-          fetch-depth: 0
       - id: push-all
         run: |
           updated_refs="["
