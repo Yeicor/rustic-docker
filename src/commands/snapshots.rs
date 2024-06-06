@@ -3,9 +3,10 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use humantime::format_duration;
+use itertools::Itertools;
 use prettytable::{format, row, Table};
 
-use super::bytes;
+use super::{bytes, RusticConfig};
 use crate::backend::DecryptReadBackend;
 use crate::repo::{
     DeleteOption, SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion,
@@ -17,19 +18,38 @@ pub(super) struct Opts {
     filter: SnapshotFilter,
 
     /// Group snapshots by any combination of host,paths,tags
-    #[clap(long, short = 'g', value_name = "CRITERION", default_value = "")]
+    #[clap(
+        long,
+        short = 'g',
+        value_name = "CRITERION",
+        default_value = "host,paths"
+    )]
     group_by: SnapshotGroupCriterion,
 
     /// Show detailed information about snapshots
     #[clap(long)]
     long: bool,
 
+    /// Show snapshots in json format
+    #[clap(long, conflicts_with = "long")]
+    json: bool,
+
+    /// Show all snapshots instead of summarizing identical follow-up snapshots
+    #[clap(long, conflicts_with_all = &["long", "json"])]
+    all: bool,
+
     /// Snapshots to show
     #[clap(value_name = "ID")]
     ids: Vec<String>,
 }
 
-pub(super) async fn execute(be: &impl DecryptReadBackend, opts: Opts) -> Result<()> {
+pub(super) async fn execute(
+    be: &impl DecryptReadBackend,
+    mut opts: Opts,
+    config_file: RusticConfig,
+) -> Result<()> {
+    config_file.merge_into("snapshot-filter", &mut opts.filter)?;
+
     let groups = match &opts.ids[..] {
         [] => SnapshotFile::group_from_backend(be, &opts.filter, &opts.group_by).await?,
         [id] if id == "latest" => {
@@ -51,6 +71,12 @@ pub(super) async fn execute(be: &impl DecryptReadBackend, opts: Opts) -> Result<
         )],
     };
 
+    if opts.json {
+        let mut stdout = std::io::stdout();
+        serde_json::to_writer_pretty(&mut stdout, &groups)?;
+        return Ok(());
+    }
+
     for (group, mut snapshots) in groups {
         if !group.is_empty() {
             println!("\nsnapshots for {:?}", group);
@@ -63,24 +89,31 @@ pub(super) async fn execute(be: &impl DecryptReadBackend, opts: Opts) -> Result<
                 display_snap(snap);
             }
         } else {
+            let snap_to_table = |(sn, count): (SnapshotFile, usize)| {
+                let tags = sn.tags.formatln();
+                let paths = sn.paths.formatln();
+                let time = sn.time.format("%Y-%m-%d %H:%M:%S");
+                let (files, dirs, size) = match &sn.summary {
+                    Some(s) => (
+                        s.total_files_processed.to_string(),
+                        s.total_dirs_processed.to_string(),
+                        bytes(s.total_bytes_processed),
+                    ),
+                    None => ("?".to_string(), "?".to_string(), "?".to_string()),
+                };
+                let id = match count {
+                    0 => format!("{}", sn.id),
+                    count => format!("{} (+{})", sn.id, count),
+                };
+                row![id, time, sn.hostname, tags, paths, r->files, r->dirs, r->size]
+            };
+
             let mut table: Table = snapshots
                 .into_iter()
-                .map(|sn| {
-                    let tags = sn.tags.formatln();
-                    let paths = sn.paths.formatln();
-                    let time = sn.time.format("%Y-%m-%d %H:%M:%S");
-                    let (files, dirs, size) = sn
-                        .summary
-                        .map(|s| {
-                            (
-                                s.total_files_processed.to_string(),
-                                s.total_dirs_processed.to_string(),
-                                bytes(s.total_bytes_processed),
-                            )
-                        })
-                        .unwrap_or_else(|| ("?".to_string(), "?".to_string(), "?".to_string()));
-                    row![sn.id, time, sn.hostname, tags, paths, r->files, r->dirs, r->size]
-                })
+                .group_by(|sn| if opts.all { sn.id } else { sn.tree })
+                .into_iter()
+                .map(|(_, mut g)| (g.next().unwrap(), g.count()))
+                .map(snap_to_table)
                 .collect();
             table.set_titles(
                 row![b->"ID", b->"Time", b->"Host", b->"Tags", b->"Paths", br->"Files",br->"Dirs", br->"Size"],
