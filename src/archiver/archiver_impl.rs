@@ -1,20 +1,18 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use bytesize::ByteSize;
 use chrono::Local;
-use futures::{stream::FuturesOrdered, StreamExt};
 use indicatif::ProgressBar;
 use log::*;
-use tokio::spawn;
+use pariter::IteratorExt;
 
 use crate::backend::DecryptWriteBackend;
 use crate::blob::{BlobType, Metadata, Node, NodeType, Packer, Tree};
 use crate::chunker::ChunkIter;
 use crate::crypto::hash;
-use crate::id::Id;
 use crate::index::{IndexedBackend, Indexer, SharedIndexer};
 use crate::repo::{ConfigFile, SnapshotFile, SnapshotSummary};
 
@@ -63,7 +61,7 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
             index.total_size(&BlobType::Tree),
         )?;
         Ok(Self {
-            path: PathBuf::from("/"),
+            path: PathBuf::default(),
             tree: Tree::new(),
             parent,
             stack: Vec::new(),
@@ -105,7 +103,13 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
         self.summary.total_dirsize_processed += size;
     }
 
-    pub async fn add_entry(&mut self, path: &Path, node: Node, p: ProgressBar) -> Result<()> {
+    pub fn add_entry(
+        &mut self,
+        path: &Path,
+        real_path: &Path,
+        node: Node,
+        p: ProgressBar,
+    ) -> Result<()> {
         let basepath = if node.is_dir() {
             path
         } else {
@@ -113,30 +117,37 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
                 .ok_or_else(|| anyhow!("file path should have a parent!"))?
         };
 
-        self.finish_trees(basepath).await?;
+        self.finish_trees(basepath)?;
 
         let missing_dirs = basepath.strip_prefix(&self.path)?;
-        for p in missing_dirs.iter() {
-            // new subdir
+        for p in missing_dirs.components() {
             self.path.push(p);
-            let tree = std::mem::replace(&mut self.tree, Tree::new());
-            if self.path == path {
-                // use Node and return
-                let new_parent = self.parent.sub_parent(&node).await?;
-                let parent = std::mem::replace(&mut self.parent, new_parent);
-                self.stack.push((node, tree, parent));
-                return Ok(());
-            } else {
-                let node = Node::new_node(p, NodeType::Dir, Metadata::default());
-                let new_parent = self.parent.sub_parent(&node).await?;
-                let parent = std::mem::replace(&mut self.parent, new_parent);
-                self.stack.push((node, tree, parent));
-            };
+            match p {
+                // ignore prefix or root dir
+                Component::Prefix(_) | Component::RootDir => {}
+                // new subdir
+                Component::Normal(p) => {
+                    let tree = std::mem::replace(&mut self.tree, Tree::new());
+                    if self.path == path {
+                        // use Node and return
+                        let new_parent = self.parent.sub_parent(&node)?;
+                        let parent = std::mem::replace(&mut self.parent, new_parent);
+                        self.stack.push((node, tree, parent));
+                        return Ok(());
+                    } else {
+                        let node = Node::new_node(p, NodeType::Dir, Metadata::default());
+                        let new_parent = self.parent.sub_parent(&node)?;
+                        let parent = std::mem::replace(&mut self.parent, new_parent);
+                        self.stack.push((node, tree, parent));
+                    }
+                }
+                _ => bail!("path should not contain current or parent dir, path: {basepath:?}"),
+            }
         }
 
         match node.node_type() {
             NodeType::File => {
-                self.backup_file(path, node, p).await?;
+                self.backup_file(real_path, node, p)?;
             }
             NodeType::Dir => {}          // is already handled, see above
             _ => self.add_file(node, 0), // all other cases: just save the given node
@@ -144,12 +155,10 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
         Ok(())
     }
 
-    pub async fn finish_trees(&mut self, path: &Path) -> Result<()> {
+    pub fn finish_trees(&mut self, path: &Path) -> Result<()> {
         while !path.starts_with(&self.path) {
             // save tree and go back to parent dir
-            let mut chunk = self.tree.serialize()?;
-            chunk.push(b'\n'); // for whatever reason, restic adds a newline, so to be compatible...
-            let id = hash(&chunk);
+            let (chunk, id) = self.tree.serialize()?;
 
             let (mut node, tree, parent) = self
                 .stack
@@ -160,13 +169,13 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
             self.tree = tree;
             self.parent = parent;
 
-            self.backup_tree(node, chunk).await?;
+            self.backup_tree(node, chunk)?;
             self.path.pop();
         }
         Ok(())
     }
 
-    pub async fn backup_tree(&mut self, node: Node, chunk: Vec<u8>) -> Result<()> {
+    pub fn backup_tree(&mut self, node: Node, chunk: Vec<u8>) -> Result<()> {
         let dirsize = chunk.len() as u64;
         let dirsize_bytes = ByteSize(dirsize).to_string_as(true);
         let id = node.subtree().unwrap();
@@ -183,29 +192,20 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
                 self.summary.dirs_new += 1;
             }
             _ => {
-                // "Matched" trees where the subree id does not match or unmach
+                // "Matched" trees where the subree id does not match or unmached trees
                 debug!("changed   tree: {:?} {}", self.path, dirsize_bytes);
                 self.summary.dirs_changed += 1;
             }
         }
 
         if !self.index.has_tree(&id) {
-            match self.tree_packer.add(&chunk, &id).await? {
-                0 => {}
-                packed_size => {
-                    self.summary.tree_blobs += 1;
-                    self.summary.data_added += dirsize;
-                    self.summary.data_added_packed += packed_size;
-                    self.summary.data_added_trees += dirsize;
-                    self.summary.data_added_trees_packed += packed_size;
-                }
-            }
+            self.tree_packer.add(&chunk, &id)?;
         }
         self.add_dir(node, dirsize);
         Ok(())
     }
 
-    pub async fn backup_file(&mut self, path: &Path, node: Node, p: ProgressBar) -> Result<()> {
+    pub fn backup_file(&mut self, path: &Path, node: Node, p: ProgressBar) -> Result<()> {
         if let ParentResult::Matched(p_node) = self.parent.is_parent(&node) {
             if p_node.content().iter().all(|id| self.index.has_data(id)) {
                 let size = *p_node.meta().size();
@@ -222,37 +222,42 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
             }
         }
         let f = File::open(path)?;
-        self.backup_reader(f, node, p).await
+        self.backup_reader(f, node, p)
     }
 
-    pub async fn backup_reader(&mut self, r: impl Read, node: Node, p: ProgressBar) -> Result<()> {
+    pub fn backup_reader(
+        &mut self,
+        r: impl Read + 'static,
+        node: Node,
+        p: ProgressBar,
+    ) -> Result<()> {
         let chunk_iter = ChunkIter::new(r, *node.meta().size() as usize, &self.poly);
         let mut content = Vec::new();
         let mut filesize: u64 = 0;
+        let index = self.index.clone();
+        let data_packer = self.data_packer.clone();
 
-        let mut queue = FuturesOrdered::new();
-
-        for chunk in chunk_iter {
-            let chunk = chunk?;
-            let size = chunk.len() as u64;
-            filesize += size;
-
-            queue.push_back(spawn(async move {
+        chunk_iter
+            .into_iter()
+            // TODO: This parallelization works pretty well for big files. For small files this produces a lot of
+            // unneccessary overhead. Maybe use a parallel hashing actor?
+            .parallel_map(move |chunk| {
+                let chunk = chunk?;
                 let id = hash(&chunk);
-                (id, chunk, size)
-            }));
+                let size = chunk.len() as u64;
 
-            if queue.len() > 8 {
-                let (id, chunk, size) = queue.next().await.unwrap()?;
-                self.process_data_junk(id, &chunk, size, &p).await?;
+                if !index.has_data(&id) {
+                    data_packer.add(&chunk, &id)?
+                }
+                p.inc(size);
+                Ok((id, size))
+            })
+            .try_for_each(|data: Result<_>| -> Result<_> {
+                let (id, size) = data?;
                 content.push(id);
-            }
-        }
-
-        while let Some(Ok((id, chunk, size))) = queue.next().await {
-            self.process_data_junk(id, &chunk, size, &p).await?;
-            content.push(id);
-        }
+                filesize += size;
+                Ok(())
+            })?;
 
         let mut node = node;
         node.set_content(content);
@@ -260,45 +265,31 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
         Ok(())
     }
 
-    async fn process_data_junk(
-        &mut self,
-        id: Id,
-        chunk: &[u8],
-        size: u64,
-        p: &ProgressBar,
-    ) -> Result<()> {
-        if !self.index.has_data(&id) {
-            match self.data_packer.add(chunk, &id).await? {
-                0 => {}
-                packed_size => {
-                    self.summary.data_blobs += 1;
-                    self.summary.data_added += size;
-                    self.summary.data_added_packed += packed_size;
-                    self.summary.data_added_files += size;
-                    self.summary.data_added_files_packed += packed_size;
-                }
-            }
-        }
-        p.inc(size);
-        Ok(())
-    }
+    pub fn finalize_snapshot(mut self) -> Result<SnapshotFile> {
+        self.finish_trees(&PathBuf::from("/"))?;
 
-    pub async fn finalize_snapshot(mut self) -> Result<SnapshotFile> {
-        self.finish_trees(&PathBuf::from("/")).await?;
-
-        let chunk = self.tree.serialize()?;
-        let id = hash(&chunk);
+        let (chunk, id) = self.tree.serialize()?;
         if !self.index.has_tree(&id) {
-            self.tree_packer.add(&chunk, &id).await?;
+            self.tree_packer.add(&chunk, &id)?;
         }
         self.snap.tree = id;
 
-        self.data_packer.finalize().await?;
-        self.tree_packer.finalize().await?;
-        {
-            let indexer = self.indexer.write().await;
-            indexer.finalize().await?;
-        }
+        let stats = self.data_packer.finalize()?;
+        self.summary.data_blobs += stats.blobs;
+        self.summary.data_added += stats.data;
+        self.summary.data_added_packed += stats.data_packed;
+        self.summary.data_added_files += stats.data;
+        self.summary.data_added_files_packed += stats.data_packed;
+
+        let stats = self.tree_packer.finalize()?;
+        self.summary.tree_blobs += stats.blobs;
+        self.summary.data_added += stats.data;
+        self.summary.data_added_packed += stats.data_packed;
+        self.summary.data_added_trees += stats.data;
+        self.summary.data_added_trees_packed += stats.data_packed;
+
+        self.indexer.write().unwrap().finalize()?;
+
         let end_time = Local::now();
         self.summary.backup_duration = (end_time - self.summary.backup_start)
             .to_std()?
@@ -306,7 +297,7 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
         self.summary.total_duration = (end_time - self.snap.time).to_std()?.as_secs_f64();
         self.summary.backup_end = end_time;
         self.snap.summary = Some(self.summary);
-        let id = self.be.save_file(&self.snap).await?;
+        let id = self.be.save_file(&self.snap)?;
         self.snap.id = id;
 
         Ok(self.snap)

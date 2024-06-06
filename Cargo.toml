@@ -1,6 +1,6 @@
 [package]
 name = "rustic-rs"
-version = "0.3.2"
+version = "0.4.0"
 description = """
 fast, encrypted, deduplicated backups powered by pure Rust
 """
@@ -23,18 +23,17 @@ strip = true
 
 [dependencies]
 # macros
-async-trait = "0.1"
 anyhow = "1"
-ambassador = "0.2"
 thiserror = "1"
 derive_more = "0.99"
 derivative = "2"
 derive-getters = "0.2"
 lazy_static = "1"
 log = "0.4"
-# async
-tokio = { version = "1", features = ["full"] }
-futures = "0.3"
+# parallelize
+crossbeam-channel = "0.5"
+rayon = "1"
+pariter = "0.5"
 #crypto
 aes256ctr_poly1305aes = "0.1"
 sha2 = "0.10"
@@ -53,7 +52,6 @@ serde-aux = "4"
 # other dependencies
 bytes = "1"
 chrono = { version = "0.4", default_features = false, features = ["clock", "serde"] }
-
 zstd = "0.11"
 enum-map = "2"
 enum-map-derive = "0.10"
@@ -64,8 +62,8 @@ ignore = "0.4"
 nix = "0.25"
 filetime = "0.2"
 # rest backend
-reqwest = {version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
-backoff = { version = "0.4", features = ["tokio"] }
+reqwest = {version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
+backoff = "0.4"
 # rclone backend
 semver = "1"
 # cache
@@ -77,17 +75,17 @@ clap_complete = "3.2.4"
 directories = "4"
 toml = "0.5"
 merge = "0.1"
-serde_with = "2"
+serde_with = "2.1"
 rpassword = "7"
-prettytable-rs = {version = "0.9", default-features = false }
 bytesize = "1"
 indicatif = "0.17"
-path-absolutize = "3"
-gethostname = "0.2"
+path-dedot = "3"
+gethostname = "0.4"
 humantime = "2"
 users = "0.11"
 itertools = "0.10"
 simplelog = "0.12"
+comfy-table = "6.1.2"
 
 [dev-dependencies]
 rstest = "0.15"

@@ -5,11 +5,10 @@ use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use clap::{AppSettings, Parser};
 use derivative::Derivative;
 use merge::Merge;
-use prettytable::{format, row, Table};
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 
-use super::{progress_counter, prune, RusticConfig};
+use super::{progress_counter, prune, table_with_titles, RusticConfig};
 use crate::backend::{Cache, DecryptFullBackend, FileType};
 use crate::repo::{
     ConfigFile, SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion, StringList,
@@ -41,7 +40,7 @@ pub(super) struct Opts {
 #[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 #[serde(default, rename_all = "kebab-case")]
 struct ConfigOpts {
-    /// Group snapshots by any combination of host,paths,tags (default: "host,paths")
+    /// Group snapshots by any combination of host,label,paths,tags (default: "host,paths")
     #[clap(long, short = 'g', value_name = "CRITERION")]
     #[serde_as(as = "Option<DisplayFromStr>")]
     group_by: Option<SnapshotGroupCriterion>,
@@ -55,7 +54,7 @@ struct ConfigOpts {
     keep: KeepOptions,
 }
 
-pub(super) async fn execute(
+pub(super) fn execute(
     be: &(impl DecryptFullBackend + Unpin),
     cache: Option<Cache>,
     mut opts: Opts,
@@ -74,10 +73,10 @@ pub(super) async fn execute(
         .unwrap_or_else(|| SnapshotGroupCriterion::from_str("host,paths").unwrap());
 
     let groups = match opts.ids.is_empty() {
-        true => SnapshotFile::group_from_backend(be, &opts.config.filter, &group_by).await?,
+        true => SnapshotFile::group_from_backend(be, &opts.config.filter, &group_by)?,
         false => vec![(
             SnapshotGroup::default(),
-            SnapshotFile::from_ids(be, &opts.ids).await?,
+            SnapshotFile::from_ids(be, &opts.ids)?,
         )],
     };
     let mut forget_snaps = Vec::new();
@@ -89,7 +88,9 @@ pub(super) async fn execute(
         snapshots.sort_unstable_by(|sn1, sn2| sn1.cmp(sn2).reverse());
         let latest_time = snapshots[0].time;
         let mut group_keep = opts.config.keep.clone();
-        let mut table = Table::new();
+        let mut table = table_with_titles([
+            "ID", "Time", "Host", "Label", "Tags", "Paths", "Action", "Reason",
+        ]);
 
         let mut iter = snapshots.iter().peekable();
         let mut last = None;
@@ -123,18 +124,23 @@ pub(super) async fn execute(
 
             let tags = sn.tags.formatln();
             let paths = sn.paths.formatln();
-            let time = sn.time.format("%Y-%m-%d %H:%M:%S");
-            table.add_row(row![sn.id, time, sn.hostname, tags, paths, action, reason]);
+            let time = sn.time.format("%Y-%m-%d %H:%M:%S").to_string();
+            table.add_row([
+                &sn.id.to_string(),
+                &time,
+                &sn.hostname,
+                &sn.label,
+                &tags,
+                &paths,
+                action,
+                &reason,
+            ]);
 
             last = Some(sn);
         }
-        table.set_titles(
-            row![b->"ID", b->"Time", b->"Host", b->"Tags", b->"Paths", b->"Action", br->"Reason"],
-        );
-        table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
         println!();
-        table.printstd();
+        println!("{table}");
         println!();
     }
 
@@ -146,13 +152,12 @@ pub(super) async fn execute(
         ),
         (false, false) => {
             let p = progress_counter("removing snapshots...");
-            be.delete_list(FileType::Snapshot, true, forget_snaps.clone(), p)
-                .await?;
+            be.delete_list(FileType::Snapshot, true, forget_snaps.clone(), p)?;
         }
     }
 
     if opts.prune {
-        prune::execute(be, cache, opts.prune_opts, config, forget_snaps).await?;
+        prune::execute(be, cache, opts.prune_opts, config, forget_snaps)?;
     }
 
     Ok(())
@@ -291,7 +296,7 @@ impl KeepOptions {
         latest_time: DateTime<Local>,
     ) -> Option<String> {
         let mut keep = false;
-        let mut reason = String::new();
+        let mut reason = Vec::new();
 
         if self
             .keep_ids
@@ -299,12 +304,12 @@ impl KeepOptions {
             .any(|id| sn.id.to_hex().starts_with(id))
         {
             keep = true;
-            reason.push_str("id\n");
+            reason.push("id");
         }
 
         if !self.keep_tags.is_empty() && sn.tags.matches(&self.keep_tags) {
             keep = true;
-            reason.push_str("tags\n");
+            reason.push("tags");
         }
 
         let keep_checks = [
@@ -357,17 +362,15 @@ impl KeepOptions {
                 if *counter > 0 {
                     *counter -= 1;
                     keep = true;
-                    reason.push_str(reason1);
-                    reason.push('\n');
+                    reason.push(reason1);
                 }
                 if sn.time + Duration::from_std(*within).unwrap() > latest_time {
                     keep = true;
-                    reason.push_str(reason2);
-                    reason.push('\n');
+                    reason.push(reason2);
                 }
             }
         }
 
-        keep.then_some(reason)
+        keep.then_some(reason.join("\n"))
     }
 }
