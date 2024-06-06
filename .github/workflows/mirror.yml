@@ -86,6 +86,10 @@ jobs:
 
   trigger-docker-for-updates:
     needs: [ mirror ]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     strategy:
       matrix:
         ref: ${{fromJSON(needs.mirror.outputs.updatedrefs)}}
