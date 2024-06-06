@@ -93,7 +93,7 @@ jobs:
     strategy:
       matrix:
         ref: ${{fromJSON(needs.mirror.outputs.updatedrefs)}}
-    continue-on-error: ${{ always() }}  # Very old versions may not build anymore
+    continue-on-error: true  # Very old versions may not build anymore
     uses: ./.github/workflows/docker-publish.yml
     with:
       ref: ${{ matrix.ref }}
