@@ -22,9 +22,9 @@ jobs:
           repository: 'rustic-rs/rustic'
           fetch-depth: 0
       - run: |
-          find ${GITHUB_WORKSPACE}/..
+          find $(dirname ${GITHUB_WORKSPACE})
           mv ${GITHUB_WORKSPACE} ${GITHUB_WORKSPACE}_old
-          find ${GITHUB_WORKSPACE}/..
+          find $(dirname ${GITHUB_WORKSPACE})
           find ${GITHUB_WORKSPACE}_old/ -type f -not \( -path "${GITHUB_WORKSPACE}_old/.github/workflows/yeicor-" -or -path "${GITHUB_WORKSPACE}_old/renovate.json" \) -delete
           find ${GITHUB_WORKSPACE}_old/ -type d -empty -delete
           find ${GITHUB_WORKSPACE}_old/
