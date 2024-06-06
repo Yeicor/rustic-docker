@@ -60,13 +60,8 @@ pub(super) fn execute(
     let data: Bytes = serde_json::to_vec(&keyfile)?.into();
     let id = hash(&data);
     be.create()?;
-    be.write_bytes(FileType::Key, &id, false, data.clone())?;
-
-    if let Some(hot_be) = hot_be {
-        hot_be.create()?;
-        hot_be.write_bytes(FileType::Key, &id, false, data)?;
-    }
-    println!("key {} successfully added.", id);
+    be.write_bytes(FileType::Key, &id, false, data)?;
+    println!("key {id} successfully added.");
 
     // save config
     let dbe = DecryptBackend::new(be, key.clone());
@@ -77,7 +72,7 @@ pub(super) fn execute(
         config.is_hot = Some(true);
         dbe.save_file(&config)?;
     }
-    println!("repository {} successfully created.", repo_id);
+    println!("repository {repo_id} successfully created.");
 
     Ok(())
 }

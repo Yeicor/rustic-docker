@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -16,7 +17,7 @@ use nom::{
     sequence::delimited,
     IResult,
 };
-use rpassword::{prompt_password, read_password_from_bufread};
+use rpassword::prompt_password;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 
@@ -91,6 +92,14 @@ pub struct RepositoryOptions {
     #[clap(long, global = true, value_name = "DURATION")]
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub(crate) warm_up_wait: Option<humantime::Duration>,
+
+    #[clap(skip)]
+    #[merge(strategy = overwrite)]
+    options: HashMap<String, String>,
+}
+
+fn overwrite<T>(left: &mut T, right: T) {
+    *left = right;
 }
 
 // parse a command
@@ -107,6 +116,23 @@ pub(crate) fn parse_command<'a, E: ParseError<&'a str>>(
             is_not(" \t\r\n"),                             // strings not containing any space
         )),
     )(input)
+}
+
+fn read_password_from_reader(file: &mut impl BufRead) -> std::io::Result<String> {
+    let mut password = String::new();
+    file.read_line(&mut password)?;
+
+    // Remove the \n from the line if present
+    if password.ends_with('\n') {
+        password.pop();
+    }
+
+    // Remove the \r from the line if present
+    if password.ends_with('\r') {
+        password.pop();
+    }
+
+    Ok(password)
 }
 
 pub struct Repository {
@@ -129,7 +155,10 @@ impl Repository {
             .map(|repo| ChooseBackend::from_url(repo))
             .transpose()?;
 
-        let be = HotColdBackend::new(be, be_hot.clone());
+        let mut be = HotColdBackend::new(be, be_hot.clone());
+        for (opt, value) in &opts.options {
+            be.set_option(opt, value)?;
+        }
         let mut name = opts.repository.as_ref().unwrap().clone();
         if let Some(repo_hot) = &opts.repo_hot {
             name.push('#');
@@ -157,20 +186,20 @@ impl Repository {
                         .with_context(|| format!("error opening password file {file:?}"))?,
                 );
                 Ok(Some(
-                    read_password_from_bufread(&mut file).context("error reading password file")?,
+                    read_password_from_reader(&mut file).context("error reading password file")?,
                 ))
             }
             (_, _, Some(command)) => {
-                let mut commands = parse_command::<()>(command)?.1;
+                let commands = parse_command::<()>(command)?.1;
                 debug!("commands: {commands:?}");
                 let output = Command::new(commands[0])
-                    .args(&mut commands[1..])
+                    .args(&commands[1..])
                     .output()
                     .with_context(|| format!("failed to call password command {commands:?}"))?;
 
                 let mut pwd = BufReader::new(&*output.stdout);
                 Ok(Some(
-                    read_password_from_bufread(&mut pwd)
+                    read_password_from_reader(&mut pwd)
                         .context("error reading password from command")?,
                 ))
             }

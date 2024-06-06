@@ -1,6 +1,6 @@
 [package]
 name = "rustic-rs"
-version = "0.4.3"
+version = "0.4.4"
 description = """
 fast, encrypted, deduplicated backups powered by pure Rust
 """
@@ -39,11 +39,11 @@ sha2 = "0.10"
 rand = "0.8"
 scrypt = { version = "0.10", default-features = false }
 # chunker / packer
-cdc = "0.1"
+# cdc = "0.1"
 integer-sqrt = "0.1"
 # serialization
 base64 = "0.20"
-binrw = "0.10"
+binrw = "0.11"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -54,12 +54,13 @@ chrono = { version = "0.4", default_features = false, features = ["clock", "serd
 zstd = "0.12"
 enum-map = "2"
 enum-map-derive = "0.11"
-self_update = {version = "0.34", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
+self_update = {version = "0.36", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
 # local backend
 walkdir = "2"
 ignore = "0.4"
 nix = "0.26"
 filetime = "0.2"
+aho-corasick = "0.7"
 # rest backend
 reqwest = {version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
 backoff = "0.4"
@@ -73,7 +74,7 @@ clap = { version = "3", features = ["derive", "env"] }
 clap_complete = "3.2.4"
 directories = "4"
 nom = "7"
-toml = "0.5"
+toml = "0.7"
 merge = "0.1"
 serde_with = "2.2"
 rpassword = "7"

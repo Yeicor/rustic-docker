@@ -144,7 +144,7 @@ impl ReadBackend for RestBackend {
                 // format which is delivered by the REST-service
                 #[derive(Deserialize)]
                 struct ListEntry {
-                    name: Id,
+                    name: String,
                     size: u32,
                 }
 
@@ -155,7 +155,13 @@ impl ReadBackend for RestBackend {
                     .send()?
                     .check_error()?
                     .json::<Vec<ListEntry>>()?;
-                Ok(list.into_iter().map(|i| (i.name, i.size)).collect())
+                Ok(list
+                    .into_iter()
+                    .filter_map(|i| match Id::from_hex(&i.name) {
+                        Ok(id) => Some((id, i.size)),
+                        Err(_) => None,
+                    })
+                    .collect())
             },
             notify,
         )?)
@@ -188,7 +194,7 @@ impl ReadBackend for RestBackend {
     ) -> Result<Bytes> {
         trace!("reading tpe: {tpe:?}, id: {id}, offset: {offset}, length: {length}");
         let offset2 = offset + length - 1;
-        let header_value = format!("bytes={}-{}", offset, offset2);
+        let header_value = format!("bytes={offset}-{offset2}");
         let url = self.url(tpe, id)?;
         Ok(backoff::retry_notify(
             self.backoff.clone(),
