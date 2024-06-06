@@ -1,195 +1,107 @@
-//! `repoinfo` subcommand
-
-use crate::{
-    commands::{get_repository, open_repository},
-    helpers::{bytes_size_to_string, table_right_from},
-    status_err, Application, RUSTIC_APP,
-};
-
-use abscissa_core::{Command, Runnable, Shutdown};
-use serde::Serialize;
-
 use anyhow::Result;
-use rustic_core::{IndexInfos, RepoFileInfo, RepoFileInfos};
+use clap::Parser;
+use futures::TryStreamExt;
+use prettytable::{cell, format, row, Table};
+use vlog::*;
 
-/// `repoinfo` subcommand
-#[derive(clap::Parser, Command, Debug)]
-pub(crate) struct RepoInfoCmd {
-    /// Only scan repository files (doesn't need repository password)
-    #[clap(long)]
-    only_files: bool,
+use super::{bytes, progress_counter};
+use crate::backend::{DecryptReadBackend, ALL_FILE_TYPES};
+use crate::blob::BlobType;
+use crate::index::IndexEntry;
+use crate::repo::IndexFile;
 
-    /// Only scan index
-    #[clap(long)]
-    only_index: bool,
+#[derive(Parser)]
+pub(super) struct Opts;
 
-    /// Show infos in json format
-    #[clap(long)]
-    json: bool,
-}
+pub(super) async fn execute(be: &impl DecryptReadBackend, _opts: Opts) -> Result<()> {
+    v1!("scanning files...");
 
-impl Runnable for RepoInfoCmd {
-    fn run(&self) {
-        if let Err(err) = self.inner_run() {
-            status_err!("{}", err);
-            RUSTIC_APP.shutdown(Shutdown::Crash);
-        };
+    let mut table = Table::new();
+    let mut total_count = 0;
+    let mut total_size = 0;
+    for tpe in ALL_FILE_TYPES {
+        let list = be.list_with_size(tpe).await?;
+        let count = list.len();
+        let size = list.iter().map(|f| f.1 as u64).sum();
+        table.add_row(row![format!("{:?}", tpe), r->count, r->bytes(size)]);
+        total_count += count;
+        total_size += size;
     }
-}
+    table.add_row(row!["Total",r->total_count,r->bytes(total_size)]);
 
-/// Infos about the repository
-///
-/// This struct is used to serialize infos in `json` format.
-#[serde_with::apply(Option => #[serde(default, skip_serializing_if = "Option::is_none")])]
-#[derive(Serialize)]
-struct Infos {
-    files: Option<RepoFileInfos>,
-    index: Option<IndexInfos>,
-}
+    table.set_titles(row![b->"File type", br->"Count", br->"Total Size"]);
+    table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+    println!();
+    table.printstd();
+    println!();
 
-impl RepoInfoCmd {
-    fn inner_run(&self) -> Result<()> {
-        let config = RUSTIC_APP.config();
+    v1!("scanning index...");
+    let p = progress_counter();
+    let mut stream = be.stream_all::<IndexFile>(p.clone()).await?;
 
-        let infos = Infos {
-            files: (!self.only_index)
-                .then(|| -> Result<_> {
-                    let repo = get_repository(&config.repository)?;
-                    Ok(repo.infos_files()?)
-                })
-                .transpose()?,
-            index: (!self.only_files)
-                .then(|| -> Result<_> {
-                    let repo = open_repository(&config.repository)?;
-                    Ok(repo.infos_index()?)
-                })
-                .transpose()?,
-        };
+    #[derive(Default)]
+    struct Info {
+        count: u64,
+        size: u64,
+        data_size: u64,
+    }
 
-        if self.json {
-            let mut stdout = std::io::stdout();
-            serde_json::to_writer_pretty(&mut stdout, &infos)?;
-            return Ok(());
+    impl Info {
+        fn add(&mut self, ie: IndexEntry) {
+            self.count += 1;
+            self.size += *ie.length() as u64;
+            self.data_size += ie.data_length() as u64;
         }
+    }
 
-        if let Some(file_info) = infos.files {
-            print_file_info("repository files", file_info.repo);
-            if let Some(info) = file_info.repo_hot {
-                print_file_info("hot repository files", info);
+    let mut tree = Info::default();
+    let mut data = Info::default();
+    let mut tree_delete = Info::default();
+    let mut data_delete = Info::default();
+
+    while let Some((_, index)) = stream.try_next().await? {
+        for pack in &index.packs {
+            for blob in &pack.blobs {
+                let ie = IndexEntry::from_index_blob(blob, pack.id);
+                match blob.tpe {
+                    BlobType::Tree => tree.add(ie),
+                    BlobType::Data => data.add(ie),
+                }
             }
         }
 
-        if let Some(index_info) = infos.index {
-            print_index_info(index_info);
+        for pack in &index.packs_to_delete {
+            for blob in &pack.blobs {
+                let ie = IndexEntry::from_index_blob(blob, pack.id);
+                match blob.tpe {
+                    BlobType::Tree => tree_delete.add(ie),
+                    BlobType::Data => data_delete.add(ie),
+                }
+            }
         }
-        Ok(())
     }
-}
+    p.finish_with_message("done");
 
-/// Print infos about repository files
-///
-/// # Arguments
-///
-/// * `text` - the text to print before the table
-/// * `info` - the [`RepoFileInfo`]s to print
-pub fn print_file_info(text: &str, info: Vec<RepoFileInfo>) {
-    let mut table = table_right_from(1, ["File type", "Count", "Total Size"]);
-    let mut total_count = 0;
-    let mut total_size = 0;
-    for row in info {
-        _ = table.add_row([
-            format!("{:?}", row.tpe),
-            row.count.to_string(),
-            bytes_size_to_string(row.size),
-        ]);
-        total_count += row.count;
-        total_size += row.size;
+    let mut table = Table::new();
+
+    table.add_row(row!["Tree",r->tree.count,r->bytes(tree.data_size), r->bytes(tree.size)]);
+    table.add_row(row!["Data",r->data.count,r->bytes(data.data_size),r->bytes(data.size)]);
+    if tree_delete.count > 0 {
+        table.add_row(row!["Tree to delete",r->tree_delete.count,r->bytes(tree_delete.data_size),r->bytes(tree_delete.size)]);
     }
-    println!("{text}");
-    _ = table.add_row([
-        "Total".to_string(),
-        total_count.to_string(),
-        bytes_size_to_string(total_size),
-    ]);
-
-    println!();
-    println!("{table}");
-    println!();
-}
-
-/// Print infos about index
-///
-/// # Arguments
-///
-/// * `index_info` - the [`IndexInfos`] to print
-pub fn print_index_info(index_info: IndexInfos) {
-    let mut table = table_right_from(
-        1,
-        ["Blob type", "Count", "Total Size", "Total Size in Packs"],
+    if data_delete.count > 0 {
+        table.add_row(row!["Data to delete",r->data_delete.count,r->bytes(data_delete.data_size),r->bytes(data_delete.size)]);
+    }
+    table.add_row(
+        row!["Total",r->tree.count + data.count+tree_delete.count + data_delete.count,
+        r->bytes(tree.data_size+data.data_size+tree_delete.data_size+data_delete.data_size),
+        r->bytes(tree.size+data.size+tree_delete.size+data_delete.size)],
     );
 
-    let mut total_count = 0;
-    let mut total_data_size = 0;
-    let mut total_size = 0;
-
-    for blobs in &index_info.blobs {
-        _ = table.add_row([
-            format!("{:?}", blobs.blob_type),
-            blobs.count.to_string(),
-            bytes_size_to_string(blobs.data_size),
-            bytes_size_to_string(blobs.size),
-        ]);
-        total_count += blobs.count;
-        total_data_size += blobs.data_size;
-        total_size += blobs.size;
-    }
-    for blobs in &index_info.blobs_delete {
-        if blobs.count > 0 {
-            _ = table.add_row([
-                format!("{:?} to delete", blobs.blob_type),
-                blobs.count.to_string(),
-                bytes_size_to_string(blobs.data_size),
-                bytes_size_to_string(blobs.size),
-            ]);
-            total_count += blobs.count;
-            total_data_size += blobs.data_size;
-            total_size += blobs.size;
-        }
-    }
-
-    _ = table.add_row([
-        "Total".to_string(),
-        total_count.to_string(),
-        bytes_size_to_string(total_data_size),
-        bytes_size_to_string(total_size),
-    ]);
-
+    table.set_titles(row![b->"Blob type", br->"Count", br->"Total Size",br->"Total Size in Packs"]);
+    table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
     println!();
-    println!("{table}");
+    table.printstd();
 
-    let mut table = table_right_from(
-        1,
-        ["Blob type", "Pack Count", "Minimum Size", "Maximum Size"],
-    );
-
-    for packs in index_info.packs {
-        _ = table.add_row([
-            format!("{:?} packs", packs.blob_type),
-            packs.count.to_string(),
-            packs.min_size.map_or("-".to_string(), bytes_size_to_string),
-            packs.max_size.map_or("-".to_string(), bytes_size_to_string),
-        ]);
-    }
-    for packs in index_info.packs_delete {
-        if packs.count > 0 {
-            _ = table.add_row([
-                format!("{:?} packs to delete", packs.blob_type),
-                packs.count.to_string(),
-                packs.min_size.map_or("-".to_string(), bytes_size_to_string),
-                packs.max_size.map_or("-".to_string(), bytes_size_to_string),
-            ]);
-        }
-    }
-    println!();
-    println!("{table}");
+    Ok(())
 }
