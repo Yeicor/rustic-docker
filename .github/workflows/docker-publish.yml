@@ -16,12 +16,12 @@ jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      status: ${{ steps.early.status }}
+      status: ${{ steps.output.status }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-      - id: early
+      - id: output
         run: |
           if [ -f Dockerfile ]; then
             echo "status=success" | tee /dev/stderr >> $GITHUB_OUTPUT
