@@ -70,7 +70,7 @@ jobs:
             if [[ `git status --porcelain` ]]; then # Changes
               git commit -am "Automated sync of original sources"
               if [[ "$bt_is_tag" == "true" ]]; then
-                git tag "$bt"
+                git tag -f "$bt"
               else
                 git branch -m "autobranchfortag_$bt" "$bt"
               fi
