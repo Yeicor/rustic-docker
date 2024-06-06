@@ -74,7 +74,7 @@ jobs:
               else
                 git branch -m "autobranchfortag_$bt" "$bt"
               fi
-              git push origin $bt
+              git push -f origin $bt
               echo "Changes pushed..."
             else
               echo "No changes detected..."
