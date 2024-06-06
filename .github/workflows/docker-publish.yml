@@ -21,9 +21,9 @@ jobs:
       - id: early
         run: |
           if [ -f Dockerfile ]; then
-            echo "status=success" >> $GITHUB_OUTPUT
+            echo "status=success" | tee /dev/stderr >> $GITHUB_OUTPUT
           else
-            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "status=failure" | tee /dev/stderr >> $GITHUB_OUTPUT
           fi
 
   docker:
