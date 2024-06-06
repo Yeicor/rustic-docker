@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use super::{progress_counter, RusticConfig};
-use crate::backend::{LocalDestination, LocalSource, LocalSourceOptions};
+use crate::backend::{LocalDestination, LocalSource, LocalSourceOptions, ReadSourceEntry};
 use crate::blob::{Node, NodeStreamer, NodeType, Tree};
 use crate::commands::helpers::progress_spinner;
 use crate::crypto::hash;
@@ -65,7 +65,7 @@ pub(super) fn execute(
                 NodeStreamer::new(index.clone(), &node1)?,
                 NodeStreamer::new(index, &node2)?,
                 opts.no_content,
-                |_path, node1, node2| Ok(node1.content() == node2.content()),
+                |_path, node1, node2| Ok(node1.content == node2.content),
                 opts.metadata,
             )
         }
@@ -85,8 +85,8 @@ pub(super) fn execute(
                 .metadata()
                 .with_context(|| format!("Error accessing {path2:?}"))?
                 .is_dir();
-            let src = LocalSource::new(opts.ignore_opts, path2.clone())?.map(|item| {
-                let (path, node) = item?;
+            let src = LocalSource::new(opts.ignore_opts, &[&path2])?.map(|item| {
+                let ReadSourceEntry { path, node, .. } = item?;
                 let path = if is_dir {
                     // remove given path prefix for dirs as local path
                     path.strip_prefix(&path2)?.to_path_buf()
@@ -133,7 +133,7 @@ fn identical_content_local(
         None => return Ok(false),
     };
 
-    for id in node.content() {
+    for id in node.content.iter().flatten() {
         let ie = index
             .get_data(id)
             .ok_or_else(|| anyhow!("did not find id {} in index", id))?;

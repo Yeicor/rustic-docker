@@ -37,18 +37,20 @@ Improvements:
  * `backup` command can use `.gitignore` files
  * `restore` uses existing files; also option `--delete` available
  * Snapshots save much more information, available in `snapshots` command
+ * Integrates the [Rhai](https://rhai.rs/) script language for snapshot filtering
  * Allows to save repository options in the repository config file via the command `config`
+ * New command `merge`
  * New command `repo-info`
  * `check` command checks and uses cache; option `--trust-cache` is available
  * Option `prune --fast-repack` for faster repacking
  * Syntax `<SNAPSHOT>[:PATH]` is available for many commands
  
 Current limitations:
- * Runs so far only on Linux and MacOS, Windows support is WIP
+ * Supported platforms are Linux and MacOS and other Unixes, Windows support is experimental
  
 ## Open points:
  * [ ] Add tests and benchmarks
- * [ ] Add missing commands: dump, find, mount
+ * [ ] Add missing commands: find, mount
  * [ ] Improve error handling
  * [ ] Parallelize the code even more and optimize for speed where useful
 

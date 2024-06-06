@@ -1,7 +1,9 @@
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::mem;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
+use std::str;
 
 use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -12,6 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::crypto::hash;
 use crate::id::Id;
 use crate::index::IndexedBackend;
+use crate::repofile::SnapshotSummary;
 
 use super::{Metadata, Node, NodeType};
 
@@ -58,23 +61,37 @@ impl Tree {
     pub fn node_from_path(be: &impl IndexedBackend, id: Id, path: &Path) -> Result<Node> {
         let mut node = Node::new_node(OsStr::new(""), NodeType::Dir, Metadata::default());
         node.set_subtree(id);
+
         for p in path.components() {
-            match p {
-                Component::RootDir | Component::Prefix(_) => {}
-                Component::Normal(p) => {
-                    let id = node.subtree().ok_or_else(|| anyhow!("{p:?} is no dir"))?;
-                    let tree = Tree::from_backend(be, id)?;
-                    node = tree
-                        .nodes
-                        .into_iter()
-                        .find(|node| node.name() == p)
-                        .ok_or_else(|| anyhow!("{p:?} not found"))?;
-                }
-                _ => bail!("path should not contain current or parent dir, path: {path:?}"),
+            if let Some(p) = comp_to_osstr(p)? {
+                let id = node.subtree().ok_or_else(|| anyhow!("{p:?} is no dir"))?;
+                let tree = Tree::from_backend(be, id)?;
+                node = tree
+                    .nodes
+                    .into_iter()
+                    .find(|node| node.name() == p)
+                    .ok_or_else(|| anyhow!("{p:?} not found"))?;
             }
         }
+
         Ok(node)
     }
+}
+
+pub fn comp_to_osstr(p: Component) -> Result<Option<OsString>> {
+    let s = match p {
+        Component::RootDir => None,
+        Component::Prefix(p) => match p.kind() {
+            Prefix::Verbatim(p) | Prefix::DeviceNS(p) => Some(p.to_os_string()),
+            Prefix::VerbatimUNC(_, q) | Prefix::UNC(_, q) => Some(q.to_os_string()),
+            Prefix::VerbatimDisk(p) | Prefix::Disk(p) => {
+                Some(OsStr::new(str::from_utf8(&[p])?).to_os_string())
+            }
+        },
+        Component::Normal(p) => Some(p.to_os_string()),
+        _ => bail!("path should not contain current or parent dir"),
+    };
+    Ok(s)
 }
 
 impl IntoIterator for Tree {
@@ -254,4 +271,124 @@ impl Iterator for TreeStreamerOnce {
         }
         Some(Ok((path, tree)))
     }
+}
+
+pub fn merge_trees(
+    be: &impl IndexedBackend,
+    trees: Vec<Id>,
+    cmp: &impl Fn(&Node, &Node) -> Ordering,
+    save: &impl Fn(Tree) -> Result<(Id, u64)>,
+    summary: &mut SnapshotSummary,
+) -> Result<Id> {
+    // We store nodes with the index of the tree in an Binary Heap where we sort only by node name
+    struct SortedNode(Node, usize);
+    impl PartialEq for SortedNode {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.name == other.0.name
+        }
+    }
+    impl PartialOrd for SortedNode {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.0.name.partial_cmp(&other.0.name).map(|o| o.reverse())
+        }
+    }
+    impl Eq for SortedNode {}
+    impl Ord for SortedNode {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.0.name.cmp(&other.0.name).reverse()
+        }
+    }
+
+    let mut tree_iters: Vec<_> = trees
+        .iter()
+        .map(|id| Tree::from_backend(be, *id).map(|tree| tree.into_iter()))
+        .collect::<Result<_>>()?;
+
+    // fill Heap with first elements from all trees
+    let mut elems = BinaryHeap::new();
+    for (num, iter) in tree_iters.iter_mut().enumerate() {
+        if let Some(node) = iter.next() {
+            elems.push(SortedNode(node, num));
+        }
+    }
+
+    let mut tree = Tree::new();
+    let (mut node, mut num) = match elems.pop() {
+        None => {
+            let (id, size) = save(tree)?;
+            summary.dirs_unmodified += 1;
+            summary.total_dirs_processed += 1;
+            summary.total_dirsize_processed += size;
+            return Ok(id);
+        }
+        Some(SortedNode(node, num)) => (node, num),
+    };
+
+    let mut nodes = Vec::new();
+    loop {
+        // push next elemet from tree_iters[0] (if any is left) into BinaryHeap
+        if let Some(next_node) = tree_iters[num].next() {
+            elems.push(SortedNode(next_node, num));
+        }
+
+        match elems.pop() {
+            None => {
+                // Add node to nodes list
+                nodes.push(node);
+                // no node left to proceed, merge nodes and quit
+                tree.add(merge_nodes(be, nodes, cmp, save, summary)?);
+                break;
+            }
+            Some(SortedNode(new_node, new_num)) if node.name != new_node.name => {
+                // Add node to nodes list
+                nodes.push(node);
+                // next node has other name; merge present nodes
+                tree.add(merge_nodes(be, nodes, cmp, save, summary)?);
+                nodes = Vec::new();
+                // use this node as new node
+                (node, num) = (new_node, new_num);
+            }
+            Some(SortedNode(new_node, new_num)) => {
+                // Add node to nodes list
+                nodes.push(node);
+                // use this node as new node
+                (node, num) = (new_node, new_num);
+            }
+        };
+    }
+    let (id, size) = save(tree)?;
+    if trees.contains(&id) {
+        summary.dirs_unmodified += 1;
+    } else {
+        summary.dirs_changed += 1;
+    }
+    summary.total_dirs_processed += 1;
+    summary.total_dirsize_processed += size;
+    Ok(id)
+}
+
+fn merge_nodes(
+    be: &impl IndexedBackend,
+    nodes: Vec<Node>,
+    cmp: &impl Fn(&Node, &Node) -> Ordering,
+    save: &impl Fn(Tree) -> Result<(Id, u64)>,
+    summary: &mut SnapshotSummary,
+) -> Result<Node> {
+    let trees: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.is_dir())
+        .map(|node| node.subtree().unwrap())
+        .collect();
+
+    let mut node = nodes.into_iter().max_by(|n1, n2| cmp(n1, n2)).unwrap();
+
+    // if this is a dir, merge with all other dirs
+    if node.is_dir() {
+        node.subtree = Some(merge_trees(be, trees, cmp, save, summary)?);
+    } else {
+        summary.files_unmodified += 1;
+        summary.total_files_processed += 1;
+        summary.total_bytes_processed += node.meta.size;
+    }
+    Ok(node)
 }

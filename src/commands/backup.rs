@@ -1,36 +1,34 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Result};
-use chrono::{Duration, Local};
+use anyhow::{bail, Result};
+use chrono::Local;
 use clap::{AppSettings, Parser};
-use gethostname::gethostname;
 use log::*;
 use merge::Merge;
 use path_dedot::ParseDot;
 use serde::Deserialize;
-use serde_with::{serde_as, DisplayFromStr};
+use toml::Value;
 
 use super::{bytes, progress_bytes, progress_counter, RusticConfig};
 use crate::archiver::{Archiver, Parent};
-use crate::backend::{DryRunBackend, LocalSource, LocalSourceOptions, ReadSource};
-use crate::blob::{Metadata, Node, NodeType};
+use crate::backend::{DryRunBackend, LocalSource, LocalSourceOptions, StdinSource};
 use crate::index::IndexBackend;
 use crate::repofile::{
-    DeleteOption, SnapshotFile, SnapshotGroup, SnapshotGroupCriterion, SnapshotSummary, StringList,
+    PathList, SnapshotFile, SnapshotGroup, SnapshotGroupCriterion, SnapshotOptions,
 };
 use crate::repository::OpenRepository;
 
-#[serde_as]
 #[derive(Clone, Default, Parser, Deserialize, Merge)]
 #[clap(global_setting(AppSettings::DeriveDisplayOrder))]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) struct Opts {
     /// Output generated snapshot in json format
     #[clap(long)]
     #[merge(strategy = merge::bool::overwrite_false)]
     json: bool,
 
+    /// Do not upload or write any data, just show what would be done
     #[clap(long, short = 'n')]
     #[merge(strategy = merge::bool::overwrite_false)]
     dry_run: bool,
@@ -58,34 +56,6 @@ pub(super) struct Opts {
     #[merge(strategy = merge::bool::overwrite_false)]
     ignore_inode: bool,
 
-    /// Label snapshot with given label
-    #[clap(long, value_name = "LABEL")]
-    label: Option<String>,
-
-    /// Tags to add to backup (can be specified multiple times)
-    #[clap(long, value_name = "TAG[,TAG,..]")]
-    #[serde_as(as = "Vec<DisplayFromStr>")]
-    #[merge(strategy = merge::vec::overwrite_empty)]
-    tag: Vec<StringList>,
-
-    /// Add description to snapshot
-    #[clap(long, value_name = "DESCRIPTION")]
-    description: Option<String>,
-
-    /// Add description to snapshot from file
-    #[clap(long, value_name = "FILE", conflicts_with = "description")]
-    description_from: Option<PathBuf>,
-
-    /// Mark snapshot as uneraseable
-    #[clap(long, conflicts_with = "delete-after")]
-    #[merge(strategy = merge::bool::overwrite_false)]
-    delete_never: bool,
-
-    /// Mark snapshot to be deleted after given duration (e.g. 10d)
-    #[clap(long, value_name = "DURATION")]
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    delete_after: Option<humantime::Duration>,
-
     /// Set filename to be used when backing up from stdin
     #[clap(long, value_name = "FILENAME", default_value = "stdin")]
     #[merge(skip)]
@@ -95,9 +65,9 @@ pub(super) struct Opts {
     #[clap(long, value_name = "PATH")]
     as_path: Option<PathBuf>,
 
-    /// Set the host name manually
-    #[clap(long, value_name = "NAME")]
-    host: Option<String>,
+    #[clap(flatten)]
+    #[serde(flatten)]
+    snap_opts: SnapshotOptions,
 
     #[clap(flatten)]
     #[serde(flatten)]
@@ -108,7 +78,17 @@ pub(super) struct Opts {
     #[clap(value_name = "SOURCE")]
     #[merge(skip)]
     #[serde(skip)]
-    sources: Vec<String>,
+    cli_sources: Vec<String>,
+
+    // This is a hack to support serde(deny_unknown_fields) for deserializing the backup options from TOML
+    // while still being able to use [[backup.sources]] in the config file.
+    // A drawback is that a unkowen "sources = ..." won't be bailed...
+    // Note that unfortunately we cannot work with nested flattened structures, see
+    // https://github.com/serde-rs/serde/issues/1547
+    #[clap(skip)]
+    #[merge(skip)]
+    #[serde(rename = "sources")]
+    config_sources: Option<Value>,
 
     /// Backup source, used within config file
     #[clap(skip)]
@@ -124,13 +104,27 @@ pub(super) fn execute(
 ) -> Result<()> {
     let time = Local::now();
 
-    let mut config_opts: Vec<Opts> = config_file.get("backup.sources")?;
+    let config_opts: Vec<Opts> = config_file.get("backup.sources")?;
 
-    let sources = match (opts.sources.is_empty(), config_opts.is_empty()) {
-        (false, _) => opts.sources.clone(),
+    let config_sources: Vec<_> = config_opts
+        .iter()
+        .filter_map(|opt| match PathList::from_string(&opt.source, true) {
+            Ok(paths) => Some(paths),
+            Err(err) => {
+                warn!(
+                    "error sanitizing source=\"{}\" in config file: {err}",
+                    opt.source
+                );
+                None
+            }
+        })
+        .collect();
+
+    let sources = match (opts.cli_sources.is_empty(), config_opts.is_empty()) {
+        (false, _) => vec![PathList::from_strings(&opts.cli_sources, true)?],
         (true, false) => {
             info!("using all backup sources from config file.");
-            config_opts.iter().map(|opt| opt.source.clone()).collect()
+            config_sources.clone()
         }
         (true, true) => {
             warn!("no backup source given.");
@@ -142,18 +136,29 @@ pub(super) fn execute(
 
     for source in sources {
         let mut opts = opts.clone();
+        let index = index.clone();
+        let backup_stdin = source == PathList::from_string("-", false)?;
+        let backup_path = if backup_stdin {
+            vec![PathBuf::from(&opts.stdin_filename)]
+        } else {
+            source.paths()
+        };
 
         // merge Options from config file, if given
-        if let Some(idx) = config_opts.iter().position(|opt| opt.source == *source) {
-            info!("merging source=\"{source}\" section from config file");
-            opts.merge(config_opts.remove(idx));
+        if let Some(idx) = config_sources.iter().position(|s| s == &source) {
+            info!("merging source={source} section from config file");
+            opts.merge(config_opts[idx].clone());
         }
-        // merge Options from config file using as_path, if given
         if let Some(path) = &opts.as_path {
+            // as_path only works in combination with a single target
+            if source.len() > 1 {
+                bail!("as-path only works with a single target!");
+            }
+            // merge Options from config file using as_path, if given
             if let Some(path) = path.as_os_str().to_str() {
                 if let Some(idx) = config_opts.iter().position(|opt| opt.source == path) {
                     info!("merging source=\"{path}\" section from config file");
-                    opts.merge(config_opts.remove(idx));
+                    opts.merge(config_opts[idx].clone());
                 }
             }
         }
@@ -161,61 +166,17 @@ pub(super) fn execute(
         config_file.merge_into("backup", &mut opts)?;
 
         let be = DryRunBackend::new(repo.dbe.clone(), opts.dry_run);
-        info!("starting to backup \"{source}\"...");
-        let index = index.clone();
-        let backup_stdin = source == "-";
-        let backup_path = if backup_stdin {
-            PathBuf::from(&opts.stdin_filename)
-        } else {
-            PathBuf::from(&source).parse_dot()?.to_path_buf()
-        };
+        info!("starting to backup {source}...");
         let as_path = match opts.as_path {
             None => None,
             Some(p) => Some(p.parse_dot()?.to_path_buf()),
         };
-        let backup_path_str = as_path.as_ref().unwrap_or(&backup_path);
-        let backup_path_str = backup_path_str
-            .to_str()
-            .ok_or_else(|| anyhow!("non-unicode path {:?}", backup_path_str))?
-            .to_string();
 
-        let hostname = match opts.host {
-            Some(host) => host,
-            None => {
-                let hostname = gethostname();
-                hostname
-                    .to_str()
-                    .ok_or_else(|| anyhow!("non-unicode hostname {:?}", hostname))?
-                    .to_string()
-            }
+        let mut snap = SnapshotFile::new_from_options(opts.snap_opts, time, command.clone())?;
+        match &as_path {
+            Some(p) => snap.paths.set_paths(&[p.to_path_buf()])?,
+            None => snap.paths.set_paths(&backup_path)?,
         };
-
-        let delete = match (opts.delete_never, opts.delete_after) {
-            (true, _) => DeleteOption::Never,
-            (_, Some(d)) => DeleteOption::After(time + Duration::from_std(*d)?),
-            (false, None) => DeleteOption::NotSet,
-        };
-
-        let mut snap = SnapshotFile {
-            time,
-            hostname,
-            label: opts.label.unwrap_or_default(),
-            delete,
-            summary: Some(SnapshotSummary {
-                command: command.clone(),
-                ..Default::default()
-            }),
-            description: opts.description,
-            ..Default::default()
-        };
-
-        // use description from description file if it is given
-        if let Some(file) = opts.description_from {
-            snap.description = Some(std::fs::read_to_string(file)?);
-        }
-
-        snap.paths.add(backup_path_str.clone());
-        snap.set_tags(opts.tag.clone());
 
         // get suitable snapshot group from snapshot and opts.group_by. This is used to filter snapshots for the parent detection
         let group = SnapshotGroup::from_sn(
@@ -247,56 +208,15 @@ pub(super) fn execute(
 
         let parent = Parent::new(&index, parent_tree, opts.ignore_ctime, opts.ignore_inode);
 
+        let archiver = Archiver::new(be, index, &repo.config, parent, snap)?;
+        let p = progress_bytes("determining size...");
+
         let snap = if backup_stdin {
-            let mut archiver = Archiver::new(be, index, &repo.config, parent, snap)?;
-            let p = progress_bytes("starting backup from stdin...");
-            archiver.backup_reader(
-                std::io::stdin(),
-                Node::new(
-                    backup_path_str,
-                    NodeType::File,
-                    Metadata::default(),
-                    None,
-                    None,
-                ),
-                p.clone(),
-            )?;
-
-            let snap = archiver.finalize_snapshot()?;
-            p.finish_with_message("done");
-            snap
+            let src = StdinSource::new()?;
+            archiver.archive(src, &backup_path[0], as_path.as_ref(), &p)?
         } else {
-            let src = LocalSource::new(opts.ignore_opts.clone(), backup_path.clone())?;
-
-            let p = progress_bytes("determining size...");
-            if !p.is_hidden() {
-                let size = src.size()?;
-                p.set_length(size);
-            };
-            p.set_prefix("backing up...");
-            let mut archiver = Archiver::new(be, index.clone(), &repo.config, parent, snap)?;
-            for item in src {
-                match item {
-                    Err(e) => {
-                        warn!("ignoring error {}\n", e);
-                    }
-                    Ok((path, node)) => {
-                        let snapshot_path = if let Some(as_path) = &as_path {
-                            as_path
-                                .clone()
-                                .join(path.strip_prefix(&backup_path).unwrap())
-                        } else {
-                            path.clone()
-                        };
-                        if let Err(e) = archiver.add_entry(&snapshot_path, &path, node, p.clone()) {
-                            warn!("ignoring error {} for {:?}\n", e, path);
-                        }
-                    }
-                }
-            }
-            let snap = archiver.finalize_snapshot()?;
-            p.finish_with_message("done");
-            snap
+            let src = LocalSource::new(opts.ignore_opts.clone(), &backup_path)?;
+            archiver.archive(src, &backup_path[0], as_path.as_ref(), &p)?
         };
 
         if opts.json {
@@ -328,7 +248,7 @@ pub(super) fn execute(
             println!("snapshot {} successfully saved.", snap.id);
         }
 
-        info!("backup of \"{source}\" done.");
+        info!("backup of {source} done.");
     }
 
     Ok(())
