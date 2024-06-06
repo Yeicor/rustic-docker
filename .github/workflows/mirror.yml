@@ -44,6 +44,7 @@ jobs:
             if [[ "$bt" == "main" ]]; then
               git checkout main
             else # Auto-create...
+              git pull "autobranchfortag_$bt" || true
               git checkout "autobranchfortag_$bt" || ( git checkout main && git branch "autobranchfortag_$bt" )
             fi
             find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.git/*" -or -path "${GITHUB_WORKSPACE}/.github/*" \) -delete
