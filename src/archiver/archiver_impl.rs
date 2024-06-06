@@ -64,21 +64,6 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
     }
 
     pub fn add_file(&mut self, node: Node, size: u64) {
-        let filename = self.path.join(node.name());
-        match self.parent.is_parent(&node) {
-            ParentResult::Matched(_) => {
-                v2!("unchanged file: {:?}", filename);
-                self.summary.files_unmodified += 1;
-            }
-            ParentResult::NotMatched => {
-                v2!("changed   file: {:?}", filename);
-                self.summary.files_changed += 1;
-            }
-            ParentResult::NotFound => {
-                v2!("new       file: {:?}", filename);
-                self.summary.files_new += 1;
-            }
-        }
         self.tree.add(node);
         self.summary.total_files_processed += 1;
         self.summary.total_bytes_processed += size;
@@ -133,7 +118,7 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
         while !path.starts_with(&self.path) {
             // save tree and go back to parent dir
             let mut chunk = self.tree.serialize()?;
-            chunk.push(b'\n'); // for whatever reason, restic adds a newline, so to be compatible...
+            chunk.push('\n' as u8); // for whatever reason, restic adds a newline, so to be compatible...
             let id = hash(&chunk);
 
             let (mut node, tree, parent) = self
@@ -191,19 +176,32 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> Archiver<BE, I> {
     }
 
     pub async fn backup_file(&mut self, path: &Path, node: Node, p: ProgressBar) -> Result<()> {
-        if let ParentResult::Matched(p_node) = self.parent.is_parent(&node) {
-            if p_node.content().iter().all(|id| self.index.has_data(id)) {
-                let size = *p_node.meta().size();
-                let mut node = node;
-                node.set_content(p_node.content().to_vec());
-                self.add_file(node, size);
-                p.inc(size);
-                return Ok(());
-            } else {
-                ve1!(
-                    "missing blobs in index for unchanged file {:?}; re-reading file",
-                    self.path.join(node.name())
-                );
+        let filename = self.path.join(node.name());
+        match self.parent.is_parent(&node) {
+            ParentResult::Matched(p_node) => {
+                v2!("unchanged file: {:?}", filename);
+                self.summary.files_unmodified += 1;
+                if p_node.content().iter().all(|id| self.index.has_data(id)) {
+                    let size = *p_node.meta().size();
+                    let mut node = node;
+                    node.set_content(p_node.content().to_vec());
+                    self.add_file(node, size);
+                    p.inc(size);
+                    return Ok(());
+                } else {
+                    ve1!(
+                        "missing blobs in index for unchanged file {:?}; re-reading file",
+                        self.path.join(node.name())
+                    );
+                }
+            }
+            ParentResult::NotMatched => {
+                v2!("changed   file: {:?}", filename);
+                self.summary.files_changed += 1;
+            }
+            ParentResult::NotFound => {
+                v2!("new       file: {:?}", filename);
+                self.summary.files_new += 1;
             }
         }
         let f = File::open(path)?;

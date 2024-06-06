@@ -1,6 +1,6 @@
 [package]
 name = "rustic-rs"
-version = "0.2.0"
+version = "0.2.0-rc1"
 description = """
 restic-compatible backup tool written in pure Rust
 """
@@ -9,7 +9,7 @@ edition = "2021"
 license = "Apache-2.0 OR MIT"
 readme = "README.md"
 documentation = "https://docs.rs/rustic-rs"
-repository = "https://github.com/rustic-rs/rustic"
+repository = "https://github.com/rustic/rustic"
 keywords = ["backup", "restic", "deduplication", "encryption", "cli"]
 categories = ["command-line-utilities"]
 

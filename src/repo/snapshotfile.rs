@@ -57,7 +57,10 @@ pub enum DeleteOption {
 
 impl DeleteOption {
     fn is_not_set(&self) -> bool {
-        matches!(self, Self::NotSet)
+        match self {
+            Self::NotSet => true,
+            _ => false,
+        }
     }
 }
 
@@ -277,7 +280,10 @@ impl SnapshotFile {
 
     /// Returns whether a snapshot must be deleted now
     pub fn must_delete(&self, now: DateTime<Local>) -> bool {
-        matches!(self.delete,DeleteOption::After(time) if time < now)
+        match self.delete {
+            DeleteOption::After(time) if time < now => true,
+            _ => false,
+        }
     }
 
     /// Returns whether a snapshot must be kept now
@@ -298,12 +304,12 @@ impl PartialEq<SnapshotFile> for SnapshotFile {
 impl Eq for SnapshotFile {}
 
 impl PartialOrd for SnapshotFile {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.time.partial_cmp(&other.time)
     }
 }
 impl Ord for SnapshotFile {
-    fn cmp(&self, other: &Self) -> Ordering {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.time.cmp(&other.time)
     }
 }

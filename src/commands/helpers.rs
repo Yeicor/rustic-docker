@@ -46,13 +46,11 @@ pub async fn get_key(be: &impl ReadBackend, password_file: Option<PathBuf>) -> R
 
 pub fn progress_counter() -> ProgressBar {
     if get_verbosity_level() == 1 {
-        let p = ProgressBar::new(0).with_style(
+        ProgressBar::new(0).with_style(
             ProgressStyle::default_bar()
                 .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>10}/{len:10}")
                 .unwrap(),
-        );
-        p.enable_steady_tick(Duration::from_secs(1));
-        p
+        )
     } else {
         ProgressBar::hidden()
     }
@@ -60,7 +58,7 @@ pub fn progress_counter() -> ProgressBar {
 
 pub fn progress_bytes() -> ProgressBar {
     if get_verbosity_level() == 1 {
-        let p = ProgressBar::new(0).with_style(
+        ProgressBar::new(0).with_style(
             ProgressStyle::default_bar()
             .with_key("my_eta", |s| 
                  match (s.pos(), s.len()){
@@ -69,10 +67,8 @@ pub fn progress_bytes() -> ProgressBar {
                     (_, _) => "-".to_string(),
                 })
             .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes:>10}/{total_bytes:10} {bytes_per_sec:12} (ETA {my_eta})")
-            .unwrap()
-            );
-        p.enable_steady_tick(Duration::from_secs(1));
-        p
+            .unwrap(),
+        )
     } else {
         ProgressBar::hidden()
     }
