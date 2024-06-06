@@ -1,91 +1,105 @@
+//! `init` subcommand
+
+use abscissa_core::{status_err, Command, Runnable, Shutdown};
 use anyhow::{bail, Result};
-use bytes::Bytes;
-use clap::Parser;
-use log::*;
-use rpassword::prompt_password;
 
-use super::config::ConfigOpts;
-use super::key::KeyOpts;
-use crate::backend::{DecryptBackend, DecryptWriteBackend, FileType, WriteBackend};
-use crate::chunker;
-use crate::crypto::{hash, Key};
-use crate::id::Id;
-use crate::repofile::{ConfigFile, KeyFile};
+use crate::{Application, RUSTIC_APP};
 
-#[derive(Parser)]
-pub(super) struct Opts {
+use dialoguer::Password;
+
+use rustic_core::{ConfigOptions, KeyOptions, OpenStatus, Repository};
+
+/// `init` subcommand
+#[derive(clap::Parser, Command, Debug)]
+pub(crate) struct InitCmd {
+    /// Key options
     #[clap(flatten, next_help_heading = "Key options")]
-    key_opts: KeyOpts,
+    key_opts: KeyOptions,
 
+    /// Config options
     #[clap(flatten, next_help_heading = "Config options")]
-    config_opts: ConfigOpts,
+    config_opts: ConfigOptions,
 }
 
-pub(super) fn execute(
-    be: &impl WriteBackend,
-    hot_be: &Option<impl WriteBackend>,
-    opts: Opts,
-    password: Option<String>,
-    config_ids: Vec<Id>,
-) -> Result<()> {
-    if !config_ids.is_empty() {
-        bail!("Config file already exists. Aborting.");
+impl Runnable for InitCmd {
+    fn run(&self) {
+        if let Err(err) = self.inner_run() {
+            status_err!("{}", err);
+            RUSTIC_APP.shutdown(Shutdown::Crash);
+        };
     }
-
-    // Create config first to allow catching errors from here without writing anything
-    let repo_id = Id::random();
-    let chunker_poly = chunker::random_poly()?;
-    let version = match opts.config_opts.set_version {
-        None => 2,
-        Some(_) => 1, // will be changed later
-    };
-    let mut config = ConfigFile::new(version, repo_id, chunker_poly);
-    opts.config_opts.apply(&mut config)?;
-
-    save_config(config, be, hot_be, opts.key_opts, password)?;
-
-    Ok(())
 }
 
-pub(crate) fn save_config(
-    mut config: ConfigFile,
-    be: &impl WriteBackend,
-    hot_be: &Option<impl WriteBackend>,
-    key_opts: KeyOpts,
-    password: Option<String>,
-) -> Result<()> {
-    // generate key
-    let key = Key::new();
+impl InitCmd {
+    fn inner_run(&self) -> Result<()> {
+        let config = RUSTIC_APP.config();
 
-    let pass = match password {
-        Some(pass) => pass,
-        None => prompt_password("enter password for new key: ")?,
-    };
+        let po = config.global.progress_options;
+        let repo = Repository::new_with_progress(&config.repository, po)?;
 
-    let keyfile = KeyFile::generate(
-        key.clone(),
-        &pass,
-        key_opts.hostname,
-        key_opts.username,
-        key_opts.with_created,
-    )?;
-    let data: Bytes = serde_json::to_vec(&keyfile)?.into();
-    let id = hash(&data);
-    be.create()?;
-    be.write_bytes(FileType::Key, &id, false, data)?;
-    info!("key {id} successfully added.");
+        // Note: This is again checked in repo.init_with_password(), however we want to inform
+        // users before they are prompted to enter a password
+        if repo.config_id()?.is_some() {
+            bail!("Config file already exists. Aborting.");
+        }
 
-    // save config
-    let dbe = DecryptBackend::new(be, key.clone());
-    config.is_hot = None;
-    dbe.save_file(&config)?;
+        // Handle dry-run mode
+        if config.global.dry_run {
+            bail!(
+                "cannot initialize repository {} in dry-run mode!",
+                repo.name
+            );
+        }
 
-    if let Some(hot_be) = hot_be {
-        let dbe = DecryptBackend::new(hot_be, key);
-        config.is_hot = Some(true);
-        dbe.save_file(&config)?;
+        let _ = init(repo, &self.key_opts, &self.config_opts)?;
+        Ok(())
     }
-    info!("repository {} successfully created.", config.id);
+}
 
-    Ok(())
+/// Initialize repository
+///
+/// # Arguments
+///
+/// * `repo` - Repository to initialize
+/// * `key_opts` - Key options
+/// * `config_opts` - Config options
+///
+/// # Errors
+///
+///  * [`RepositoryErrorKind::OpeningPasswordFileFailed`] - If opening the password file failed
+/// * [`RepositoryErrorKind::ReadingPasswordFromReaderFailed`] - If reading the password failed
+/// * [`RepositoryErrorKind::FromSplitError`] - If splitting the password command failed
+/// * [`RepositoryErrorKind::PasswordCommandParsingFailed`] - If parsing the password command failed
+/// * [`RepositoryErrorKind::ReadingPasswordFromCommandFailed`] - If reading the password from the command failed
+///
+/// # Returns
+///
+/// Returns the initialized repository
+///
+/// [`RepositoryErrorKind::OpeningPasswordFileFailed`]: rustic_core::error::RepositoryErrorKind::OpeningPasswordFileFailed
+/// [`RepositoryErrorKind::ReadingPasswordFromReaderFailed`]: rustic_core::error::RepositoryErrorKind::ReadingPasswordFromReaderFailed
+/// [`RepositoryErrorKind::FromSplitError`]: rustic_core::error::RepositoryErrorKind::FromSplitError
+/// [`RepositoryErrorKind::PasswordCommandParsingFailed`]: rustic_core::error::RepositoryErrorKind::PasswordCommandParsingFailed
+/// [`RepositoryErrorKind::ReadingPasswordFromCommandFailed`]: rustic_core::error::RepositoryErrorKind::ReadingPasswordFromCommandFailed
+pub(crate) fn init<P, S>(
+    repo: Repository<P, S>,
+    key_opts: &KeyOptions,
+    config_opts: &ConfigOptions,
+) -> Result<Repository<P, OpenStatus>> {
+    let pass = repo.password()?.unwrap_or_else(|| {
+        match Password::new()
+            .with_prompt("enter password for new key")
+            .allow_empty_password(true)
+            .with_confirmation("confirm password", "passwords do not match")
+            .interact()
+        {
+            Ok(it) => it,
+            Err(err) => {
+                status_err!("{}", err);
+                RUSTIC_APP.shutdown(Shutdown::Crash);
+            }
+        }
+    });
+
+    Ok(repo.init_with_password(&pass, key_opts, config_opts)?)
 }
