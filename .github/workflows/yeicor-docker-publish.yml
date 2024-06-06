@@ -46,7 +46,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           username: ${{ matrix.username }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ matrix.registry == 'ghcr.io' && secrets.GITHUB_TOKEN || secrets.DOCKERHUB_TOKEN }}
       # TODO: cosign
       - name: Build and push
         uses: docker/build-push-action@v5
