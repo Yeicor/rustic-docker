@@ -32,7 +32,7 @@ jobs:
           fetch-depth: 0
       - run: |  
           # Delete all non-custom files from our repository (in case of deletions in the original repository)
-          find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.github/workflows/yeicor-*" -or -path "${GITHUB_WORKSPACE}/renovate.json" \) -delete
+          find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.git/*" -path "${GITHUB_WORKSPACE}/.github/workflows/yeicor-*" -or -path "${GITHUB_WORKSPACE}/renovate.json" \) -delete
           find ${GITHUB_WORKSPACE}/ -type d -empty -delete
           find ${GITHUB_WORKSPACE}/
           # Copy all files from the original repository
