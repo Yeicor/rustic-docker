@@ -19,7 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4  # Checkout self (to keep our custom files)
         with:
-          repository: 'rustic-rs/rustic'
           fetch-depth: 0
       - run: |
           find $(dirname ${GITHUB_WORKSPACE})
