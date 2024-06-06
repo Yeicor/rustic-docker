@@ -1,6 +1,6 @@
 [package]
 name = "rustic-rs"
-version = "0.4.0"
+version = "0.4.1"
 description = """
 fast, encrypted, deduplicated backups powered by pure Rust
 """
@@ -52,14 +52,14 @@ serde-aux = "4"
 # other dependencies
 bytes = "1"
 chrono = { version = "0.4", default_features = false, features = ["clock", "serde"] }
-zstd = "0.11"
+zstd = "0.12"
 enum-map = "2"
 enum-map-derive = "0.10"
 self_update = {version = "0.32", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
 # local backend
 walkdir = "2"
 ignore = "0.4"
-nix = "0.25"
+nix = "0.26"
 filetime = "0.2"
 # rest backend
 reqwest = {version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
@@ -78,7 +78,7 @@ merge = "0.1"
 serde_with = "2.1"
 rpassword = "7"
 bytesize = "1"
-indicatif = "0.17"
+indicatif = "=0.17.0" # until https://github.com/console-rs/indicatif/issues/493 is fixed.
 path-dedot = "3"
 gethostname = "0.4"
 humantime = "2"
@@ -86,8 +86,9 @@ users = "0.11"
 itertools = "0.10"
 simplelog = "0.12"
 comfy-table = "6.1.2"
+libc="0.2"
 
 [dev-dependencies]
-rstest = "0.15"
+rstest = "0.16"
 quickcheck = "1"
 quickcheck_macros = "1"
