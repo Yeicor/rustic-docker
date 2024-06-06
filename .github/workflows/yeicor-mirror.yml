@@ -22,15 +22,15 @@ jobs:
           repository: 'rustic-rs/rustic'
           fetch-depth: 0
       - run: |
-          mkdir ${GITHUB_WORKSPACE}_old
           mv ${GITHUB_WORKSPACE} ${GITHUB_WORKSPACE}_old
+          find ${GITHUB_WORKSPACE}_old/ -type f -not \( -path "${GITHUB_WORKSPACE}_old/.github/workflows/yeicor-" -or -path "${GITHUB_WORKSPACE}_old/renovate.json" \) -delete
+          find ${GITHUB_WORKSPACE}_old/ -type d -empty -delete
           mkdir ${GITHUB_WORKSPACE}
-          find ${GITHUB_WORKSPACE}_old/ -not \( -path ".github/workflows/yeicor-" -or -path "renovate.json" \) -delete
       - uses: actions/checkout@v4  # Checkout original repository
         with:
           repository: 'rustic-rs/rustic'
           fetch-depth: 0
-      - run: |
+      - run: |  # Overwrite the original repository with our files
           mv ${GITHUB_WORKSPACE}_old/* ${GITHUB_WORKSPACE}/
           git remote add mirror "git@github.com:${{ github.repository }}.git"
           git push --tags --force --prune mirror "refs/remotes/origin/*:refs/heads/*"
