@@ -1,61 +1,42 @@
-//! `list` subcommand
-
-use crate::{commands::open_repository, status_err, Application, RUSTIC_APP};
-
-use abscissa_core::{Command, Runnable, Shutdown};
-
 use anyhow::{bail, Result};
+use clap::Parser;
+use futures::StreamExt;
+use indicatif::ProgressBar;
 
-use rustic_core::repofile::{FileType, IndexFile};
+use crate::backend::{DecryptReadBackend, FileType};
+use crate::repo::IndexFile;
 
-/// `list` subcommand
-#[derive(clap::Parser, Command, Debug)]
-pub(crate) struct ListCmd {
-    /// File types to list
-    #[clap(value_parser=["blobs", "index", "packs", "snapshots", "keys"])]
+#[derive(Parser)]
+pub(super) struct Opts {
+    /// file type to list
+    #[clap(possible_values=["blobs", "index", "packs", "snapshots", "keys"])]
     tpe: String,
 }
 
-impl Runnable for ListCmd {
-    fn run(&self) {
-        if let Err(err) = self.inner_run() {
-            status_err!("{}", err);
-            RUSTIC_APP.shutdown(Shutdown::Crash);
-        };
-    }
-}
-
-impl ListCmd {
-    fn inner_run(&self) -> Result<()> {
-        let config = RUSTIC_APP.config();
-        let repo = open_repository(&config.repository)?;
-
-        let tpe = match self.tpe.as_str() {
-            // special treatment for listing blobs: read the index and display it
-            "blobs" => {
-                for item in repo.stream_files::<IndexFile>()? {
-                    let (_, index) = item?;
-                    index.packs.into_iter().for_each(|pack| {
-                        for blob in pack.blobs {
-                            println!("{:?} {:?}", blob.tpe, blob.id);
-                        }
-                    });
+pub(super) async fn execute(be: &impl DecryptReadBackend, opts: Opts) -> Result<()> {
+    let tpe = match opts.tpe.as_str() {
+        // special treatment for listing blobs: read the index and display it
+        "blobs" => {
+            let mut stream = be.stream_all::<IndexFile>(ProgressBar::hidden()).await?;
+            while let Some(index) = stream.next().await {
+                for pack in index?.1.packs {
+                    for blob in pack.blobs {
+                        println!("{:?} {}", blob.tpe, blob.id.to_hex());
+                    }
                 }
-                return Ok(());
             }
-            "index" => FileType::Index,
-            "packs" => FileType::Pack,
-            "snapshots" => FileType::Snapshot,
-            "keys" => FileType::Key,
-            t => {
-                bail!("invalid type: {}", t);
-            }
-        };
-
-        for id in repo.list(tpe)? {
-            println!("{id:?}");
+            return Ok(());
         }
+        "index" => FileType::Index,
+        "packs" => FileType::Pack,
+        "snapshots" => FileType::Snapshot,
+        "keys" => FileType::Key,
+        t => bail!("invalid type: {}", t),
+    };
 
-        Ok(())
+    for id in be.list(tpe).await? {
+        println!("{}", id.to_hex());
     }
+
+    Ok(())
 }
