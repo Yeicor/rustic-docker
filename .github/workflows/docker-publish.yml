@@ -18,6 +18,9 @@ jobs:
     outputs:
       status: ${{ steps.early.status }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - id: early
         run: |
           if [ -f Dockerfile ]; then
@@ -37,8 +40,7 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - uses: docker/setup-qemu-action@v3 # Add support for more platforms with QEMU (optional)
