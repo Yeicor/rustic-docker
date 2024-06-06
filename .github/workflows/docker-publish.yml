@@ -1,8 +1,8 @@
 name: Docker
 
 on:
-  schedule:
-    - cron: '0 * * * *'
+  # schedule:
+  #   - cron: '0 * * * *'
   pull_request: {}
   push: {}
   workflow_dispatch: {}
