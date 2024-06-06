@@ -9,12 +9,13 @@ use clap::{AppSettings, Parser};
 use derive_getters::Dissolve;
 use futures::{stream::FuturesUnordered, TryStreamExt};
 use ignore::{DirEntry, WalkBuilder};
+use log::*;
 use tokio::spawn;
-use vlog::*;
 
 use super::{bytes, progress_bytes, progress_counter, wait, warm_up, warm_up_command};
 use crate::backend::{DecryptReadBackend, FileType, LocalBackend};
 use crate::blob::{Node, NodeStreamer, NodeType, Tree};
+use crate::commands::helpers::progress_spinner;
 use crate::crypto::hash;
 use crate::id::Id;
 use crate::index::{IndexBackend, IndexedBackend};
@@ -62,35 +63,34 @@ pub(super) async fn execute(be: &(impl DecryptReadBackend + Unpin), opts: Opts) 
         if !command.contains("%id") {
             bail!("warm-up command must contain %id!")
         }
-        v1!("using warm-up command {command}")
+        info!("using warm-up command {command}")
     }
 
     let (id, path) = opts.snap.split_once(':').unwrap_or((&opts.snap, ""));
-    let snap = SnapshotFile::from_str(be, id, |_| true, progress_counter()).await?;
+    let snap = SnapshotFile::from_str(be, id, |_| true, progress_counter("")).await?;
 
-    let index = IndexBackend::new(be, progress_counter()).await?;
+    let index = IndexBackend::new(be, progress_counter("")).await?;
     let tree = Tree::subtree_id(&index, snap.tree, Path::new(path)).await?;
 
     let dest = LocalBackend::new(&opts.dest);
 
-    v1!("collecting restore information and allocating non-existing files...");
+    let p = progress_spinner("collecting file information...");
     let file_infos = allocate_and_collect(&dest, index.clone(), tree, &opts).await?;
-    v1!("total restore size: {}", bytes(file_infos.total_size));
+    p.finish();
+    info!("total restore size: {}", bytes(file_infos.total_size));
     if file_infos.matched_size > 0 {
-        v1!(
+        info!(
             "using {} of existing file contents.",
             bytes(file_infos.matched_size)
         );
     }
 
     if file_infos.total_size == file_infos.matched_size {
-        v1!("all file contents are fine.");
+        info!("all file contents are fine.");
     } else {
         if opts.warm_up {
-            v1!("warming up needed data pack files...");
             warm_up(be, file_infos.to_packs()).await?;
         } else if opts.warm_up_command.is_some() {
-            v1!("warming up needed data pack files...");
             warm_up_command(
                 file_infos.to_packs(),
                 opts.warm_up_command.as_ref().unwrap(),
@@ -98,17 +98,17 @@ pub(super) async fn execute(be: &(impl DecryptReadBackend + Unpin), opts: Opts) 
         }
         wait(opts.warm_up_wait).await;
         if !opts.dry_run {
-            v1!("restoring missing file contents...");
             restore_contents(be, &dest, file_infos).await?;
         }
     }
 
     if !opts.dry_run {
-        v1!("setting metadata...");
+        let p = progress_spinner("setting metadata...");
         restore_metadata(&dest, index, tree, &opts).await?;
+        p.finish();
     }
 
-    v1!("done.");
+    info!("restore done.");
     Ok(())
 }
 
@@ -119,6 +119,8 @@ async fn allocate_and_collect(
     tree: Id,
     opts: &Opts,
 ) -> Result<FileInfos> {
+    let dest_path = Path::new(&opts.dest);
+
     let mut file_infos = FileInfos::new();
     let mut additional_existing = false;
     // Dir stack is needed to process removal of dirs AFTER the content has been processed.
@@ -130,6 +132,8 @@ async fn allocate_and_collect(
             // don't process the root dir which should be existing
             return Ok(());
         }
+
+        debug!("additional {:?}", entry.path());
 
         match (
             opts.delete,
@@ -157,7 +161,6 @@ async fn allocate_and_collect(
             }
             (true, false, false) => dest.remove_file(entry.path())?,
             (false, _, _) => {
-                v2!("additional entry: {:?}", entry.path());
                 additional_existing = true;
             }
         }
@@ -165,20 +168,43 @@ async fn allocate_and_collect(
         Ok(())
     };
 
-    let mut process_node = |path: &PathBuf, node: &Node| -> Result<_> {
-        v3!("processing {:?}", path);
+    let mut process_node = |path: &PathBuf, node: &Node, exists: bool| -> Result<_> {
         match node.node_type() {
             NodeType::Dir => {
-                if !opts.dry_run {
-                    dest.create_dir(path)?;
+                if exists {
+                    trace!("existing dir {path:?}");
+                } else {
+                    debug!("to restore: {path:?}");
+                    if !opts.dry_run {
+                        dest.create_dir(path)?;
+                    }
                 }
             }
             NodeType::File => {
                 // collect blobs needed for restoring
-                if let Some(size) = file_infos.add_file(dest, node, path.clone(), &index)? {
-                    if !opts.dry_run {
-                        // create the file if it doesn't exist with right size
-                        dest.create_file(path, size)?;
+                match (
+                    exists,
+                    file_infos.add_file(dest, node, path.clone(), &index)?,
+                ) {
+                    (true, (None, true)) => debug!("to modify: {path:?}"),
+                    (true, (None, false)) => trace!("identical file: {path:?}"),
+                    (false, (None, _)) => {
+                        error!("non-existing file, but restore algo returned existing file??!??")
+                    }
+                    (false, (Some(size), _)) => {
+                        debug!("to restore: {path:?}");
+                        if !opts.dry_run {
+                            // create the file as it doesn't exist
+                            dest.create_file(path, size)?;
+                        }
+                    }
+                    (true, (Some(size), _)) => {
+                        debug!("to modify: {path:?} (exists with different size)");
+                        if !opts.dry_run {
+                            // remove file and re-create as it doesn't exist with right size
+                            dest.remove_file(dest_path.join(path))?;
+                            dest.create_file(path, size)?;
+                        }
                     }
                 }
             }
@@ -187,7 +213,6 @@ async fn allocate_and_collect(
         Ok(())
     };
 
-    let dest_path = Path::new(&opts.dest);
     let mut dst_iter = WalkBuilder::new(dest_path)
         .follow_links(false)
         .hidden(false)
@@ -217,24 +242,24 @@ async fn allocate_and_collect(
                     // process existing node
                     // TODO: This fails or behaves wrong if the type of the existing node
                     // does not match the type of the node in the snapshot!
-                    process_node(path, node)?;
+                    process_node(path, node, true)?;
                     next_dst = dst_iter.next();
                     next_node = node_streamer.try_next().await?;
                 }
                 Ordering::Greater => {
-                    process_node(path, node)?;
+                    process_node(path, node, false)?;
                     next_node = node_streamer.try_next().await?;
                 }
             },
             (None, Some((path, node))) => {
-                process_node(path, node)?;
+                process_node(path, node, false)?;
                 next_node = node_streamer.try_next().await?;
             }
         }
     }
 
     if additional_existing {
-        v1!("Note: additionals entries exist in destination");
+        warn!("Note: additionals entries exist in destination");
     }
 
     // empty dir stack and remove dirs
@@ -254,7 +279,7 @@ async fn restore_contents(
 ) -> Result<()> {
     let (filenames, restore_info, total_size, matched_size) = file_infos.dissolve();
 
-    let p = progress_bytes();
+    let p = progress_bytes("restoring file contents...");
     p.set_length(total_size - matched_size);
     let mut stream = FuturesUnordered::new();
 
@@ -356,20 +381,20 @@ async fn restore_metadata(
 }
 
 fn set_metadata(dest: &LocalBackend, path: &PathBuf, node: &Node, opts: &Opts) {
-    v3!("processing {:?}", path);
+    debug!("setting metadata for {:?}", path);
     dest.create_special(path, node)
-        .unwrap_or_else(|_| eprintln!("restore {:?}: creating special file failed.", path));
+        .unwrap_or_else(|_| warn!("restore {:?}: creating special file failed.", path));
     if opts.numeric_id {
         dest.set_uid_gid(path, node.meta())
-            .unwrap_or_else(|_| eprintln!("restore {:?}: setting UID/GID failed.", path));
+            .unwrap_or_else(|_| warn!("restore {:?}: setting UID/GID failed.", path));
     } else {
         dest.set_user_group(path, node.meta())
-            .unwrap_or_else(|_| eprintln!("restore {:?}: setting User/Group failed.", path));
+            .unwrap_or_else(|_| warn!("restore {:?}: setting User/Group failed.", path));
     }
     dest.set_permission(path, node.meta())
-        .unwrap_or_else(|_| eprintln!("restore {:?}: chmod failed.", path));
+        .unwrap_or_else(|_| warn!("restore {:?}: chmod failed.", path));
     dest.set_times(path, node.meta())
-        .unwrap_or_else(|_| eprintln!("restore {:?}: setting file times failed.", path));
+        .unwrap_or_else(|_| warn!("restore {:?}: setting file times failed.", path));
 }
 
 /// struct that contains information of file contents grouped by
@@ -429,9 +454,10 @@ impl FileInfos {
         file: &Node,
         name: PathBuf,
         index: &impl IndexedBackend,
-    ) -> Result<Option<u64>> {
+    ) -> Result<(Option<u64>, bool)> {
         let mut open_file = dest.get_matching_file(&name, *file.meta().size());
         let mut file_pos = 0;
+        let mut has_unmatched = false;
         if !file.content().is_empty() {
             let file_idx = self.names.len();
             self.names.push(name);
@@ -457,6 +483,8 @@ impl FileInfos {
                 self.total_size += length;
                 if matches {
                     self.matched_size += length;
+                } else {
+                    has_unmatched = true;
                 }
 
                 let pack = self.r.entry(*ie.pack()).or_insert_with(HashMap::new);
@@ -472,7 +500,7 @@ impl FileInfos {
         }
 
         // Tell to allocate the size only if the file does NOT exist with matching size
-        Ok(open_file.is_none().then(|| file_pos))
+        Ok((open_file.is_none().then_some(file_pos), has_unmatched))
     }
 
     fn to_packs(&self) -> Vec<Id> {

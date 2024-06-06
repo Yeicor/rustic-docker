@@ -1,9 +1,15 @@
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
+use std::process;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use merge::Merge;
+use rpassword::read_password_from_bufread;
 use serde::Deserialize;
+use serde_with::{serde_as, DisplayFromStr};
+use simplelog::*;
 
 use crate::backend::{
     Cache, CachedBackend, ChooseBackend, DecryptBackend, DecryptReadBackend, FileType,
@@ -14,6 +20,7 @@ use crate::repo::ConfigFile;
 mod backup;
 mod cat;
 mod check;
+mod completions;
 mod config;
 mod diff;
 mod forget;
@@ -31,8 +38,8 @@ mod snapshots;
 mod tag;
 
 use helpers::*;
+use log::*;
 use rustic_config::RusticConfig;
-use vlog::*;
 
 #[derive(Parser)]
 #[clap(about, version)]
@@ -54,6 +61,7 @@ struct Opts {
     command: Command,
 }
 
+#[serde_as]
 #[derive(Default, Parser, Deserialize, Merge)]
 #[serde(default, rename_all = "kebab-case")]
 struct GlobalOpts {
@@ -89,21 +97,15 @@ struct GlobalOpts {
     )]
     password_command: Option<String>,
 
-    /// Increase verbosity (can be used multiple times)
-    #[clap(long, short = 'v', global = true, parse(from_occurrences))]
-    #[merge(strategy = merge::num::overwrite_zero)]
-    verbose: i8,
+    /// Use this log level [default: info]
+    #[clap(long, global = true, env = "RUSTIC_LOG_LEVEL")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    log_level: Option<LevelFilter>,
 
-    /// Don't be verbose at all
-    #[clap(
-        long,
-        short = 'q',
-        global = true,
-        parse(from_occurrences),
-        conflicts_with = "verbose"
-    )]
-    #[merge(strategy = merge::num::overwrite_zero)]
-    quiet: i8,
+    /// Write log messages to the given file instead of printing them.
+    /// Note: warnings and errors are still additionally printed unless they are ignored by --log-level
+    #[clap(long, global = true, env = "RUSTIC_LOG_FILE", value_name = "LOGFILE")]
+    log_file: Option<PathBuf>,
 
     /// Don't use a cache.
     #[clap(long, global = true, env = "RUSTIC_NO_CACHE")]
@@ -131,6 +133,9 @@ enum Command {
 
     /// Change the repository configuration
     Config(config::Opts),
+
+    /// Generate shell completions
+    Completions(completions::Opts),
 
     /// Check the repository
     Check(check::Opts),
@@ -176,13 +181,47 @@ pub async fn execute() -> Result<()> {
     let command: Vec<_> = std::env::args_os().into_iter().collect();
     let args = Opts::parse_from(&command);
 
+    // get global options from command line / env and config file
     let config_file = RusticConfig::new(&args.config_profile)?;
-
     let mut opts = args.global;
     config_file.merge_into("global", &mut opts)?;
 
+    // start logger
+    let level_filter = opts.log_level.unwrap_or(LevelFilter::Info);
+    match opts.log_file {
+        None => TermLogger::init(
+            level_filter,
+            ConfigBuilder::new()
+                .set_time_level(LevelFilter::Off)
+                .build(),
+            TerminalMode::Stderr,
+            ColorChoice::Auto,
+        )?,
+
+        Some(file) => CombinedLogger::init(vec![
+            TermLogger::new(
+                level_filter.max(LevelFilter::Warn),
+                ConfigBuilder::new()
+                    .set_time_level(LevelFilter::Off)
+                    .build(),
+                TerminalMode::Stderr,
+                ColorChoice::Auto,
+            ),
+            WriteLogger::new(
+                level_filter,
+                Config::default(),
+                File::options().create(true).append(true).open(file)?,
+            ),
+        ])?,
+    }
+
     if let Command::SelfUpdate(opts) = args.command {
         self_update::execute(opts).await?;
+        return Ok(());
+    }
+
+    if let Command::Completions(opts) = args.command {
+        completions::execute(opts);
         return Ok(());
     }
 
@@ -191,9 +230,6 @@ pub async fn execute() -> Result<()> {
         .map(|s| s.to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join(" ");
-
-    let verbosity = (1 + opts.verbose - opts.quiet).clamp(0, 3);
-    set_verbosity_level(verbosity as usize);
 
     let be = match &opts.repository {
         Some(repo) => ChooseBackend::from_url(repo)?,
@@ -205,10 +241,30 @@ pub async fn execute() -> Result<()> {
         .map(|repo| ChooseBackend::from_url(&repo))
         .transpose()?;
 
+    let password = match (opts.password, opts.password_file, opts.password_command) {
+        (Some(pwd), _, _) => Some(pwd),
+        (_, Some(file), _) => {
+            let mut file = BufReader::new(File::open(file)?);
+            Some(read_password_from_bufread(&mut file)?)
+        }
+        (_, _, Some(command)) => {
+            let mut commands: Vec<_> = command.split(' ').collect();
+            let output = process::Command::new(commands[0])
+                .args(&mut commands[1..])
+                .output()?;
+
+            let mut pwd = BufReader::new(&*output.stdout);
+            Some(read_password_from_bufread(&mut pwd)?)
+        }
+        (None, None, None) => None,
+    };
+
     let config_ids = be.list(FileType::Config).await?;
 
     let (cmd, key, dbe, cache, be, be_hot, config) = match (args.command, config_ids.len()) {
-        (Command::Init(opts), _) => return init::execute(&be, &be_hot, opts, config_ids).await,
+        (Command::Init(opts), _) => {
+            return init::execute(&be, &be_hot, opts, password, config_ids).await
+        }
         (cmd, 1) => {
             let be = HotColdBackend::new(be, be_hot.clone());
             if let Some(be_hot) = &be_hot {
@@ -221,14 +277,8 @@ pub async fn execute() -> Result<()> {
                 }
             }
 
-            let key = get_key(
-                &be,
-                opts.password.as_deref(),
-                opts.password_file.as_deref(),
-                opts.password_command.as_deref(),
-            )
-            .await?;
-            ve1!("password is correct.");
+            let key = get_key(&be, password).await?;
+            info!("password is correct.");
 
             let dbe = DecryptBackend::new(&be, key.clone());
             let config: ConfigFile = dbe.get_file(&config_ids[0]).await?;
@@ -241,8 +291,8 @@ pub async fn execute() -> Result<()> {
                 .then(|| Cache::new(config.id, opts.cache_dir).ok())
                 .flatten();
             match &cache {
-                None => ve1!("using no cache"),
-                Some(cache) => ve1!("using cache at {}", cache.location()),
+                None => info!("using no cache"),
+                Some(cache) => info!("using cache at {}", cache.location()),
             }
             let be_cached = CachedBackend::new(be.clone(), cache.clone());
             let dbe = DecryptBackend::new(&be_cached, key.clone());
@@ -257,6 +307,7 @@ pub async fn execute() -> Result<()> {
         Command::Config(opts) => config::execute(&dbe, &be_hot, opts, config).await?,
         Command::Cat(opts) => cat::execute(&dbe, opts).await?,
         Command::Check(opts) => check::execute(&dbe, &cache, &be_hot, &be, opts).await?,
+        Command::Completions(_) => {} // already handled above
         Command::Diff(opts) => diff::execute(&dbe, opts).await?,
         Command::Forget(opts) => forget::execute(&dbe, cache, opts, config, config_file).await?,
         Command::Init(_) => {} // already handled above

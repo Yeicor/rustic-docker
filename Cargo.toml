@@ -1,6 +1,6 @@
 [package]
 name = "rustic-rs"
-version = "0.3.1"
+version = "0.3.2"
 description = """
 fast, encrypted, deduplicated backups powered by pure Rust
 """
@@ -31,7 +31,7 @@ derive_more = "0.99"
 derivative = "2"
 derive-getters = "0.2"
 lazy_static = "1"
-vlog = "0.1"
+log = "0.4"
 # async
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
@@ -45,7 +45,7 @@ cdc = "0.1"
 integer-sqrt = "0.1"
 # serialization
 base64 = "0.13"
-binrw = "0.9"
+binrw = "0.10"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -57,7 +57,7 @@ chrono = { version = "0.4", default_features = false, features = ["clock", "serd
 zstd = "0.11"
 enum-map = "2"
 enum-map-derive = "0.10"
-self_update = {version = "0.31", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
+self_update = {version = "0.32", default-features = false, features = ["rustls", "archive-tar", "compression-flate2"] }
 # local backend
 walkdir = "2"
 ignore = "0.4"
@@ -67,13 +67,13 @@ filetime = "0.2"
 reqwest = {version = "0.11", default-features = false, features = ["json", "rustls-tls", "stream"] }
 backoff = { version = "0.4", features = ["tokio"] }
 # rclone backend
-sha1 = "0.10"
-tempfile = "3"
+semver = "1"
 # cache
 dirs = "4"
 cachedir = "0.3"
 # commands
 clap = { version = "3", features = ["derive", "env"] }
+clap_complete = "3.2.4"
 directories = "4"
 toml = "0.5"
 merge = "0.1"
@@ -87,6 +87,7 @@ gethostname = "0.2"
 humantime = "2"
 users = "0.11"
 itertools = "0.10"
+simplelog = "0.12"
 
 [dev-dependencies]
 rstest = "0.15"

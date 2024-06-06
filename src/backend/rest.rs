@@ -2,13 +2,32 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use backoff::{backoff::Backoff, ExponentialBackoff, ExponentialBackoffBuilder};
+use backoff::{backoff::Backoff, Error, ExponentialBackoff, ExponentialBackoffBuilder};
 use bytes::Bytes;
-use reqwest::{Client, Url};
+use log::*;
+use reqwest::{Client, Response, Url};
 use serde::Deserialize;
-use vlog::*;
 
 use super::{FileType, Id, ReadBackend, WriteBackend};
+
+// trait CheckError to add user-defined methoed check_error on Response
+trait CheckError {
+    fn check_error(self) -> std::result::Result<Response, Error<reqwest::Error>>;
+}
+
+impl CheckError for Response {
+    // Check reqwest Response for error and treat errors as permanent or transient
+    fn check_error(self) -> std::result::Result<Response, Error<reqwest::Error>> {
+        match self.error_for_status() {
+            Ok(t) => Ok(t),
+            Err(err) if err.status().unwrap().is_client_error() => Err(Error::Permanent(err)),
+            Err(err) => Err(Error::Transient {
+                err,
+                retry_after: None,
+            }),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct MaybeBackoff(Option<ExponentialBackoff>);
@@ -32,9 +51,8 @@ pub struct RestBackend {
     backoff: MaybeBackoff,
 }
 
-// TODO for backoff: Handle transient vs permanent errors!
 fn notify(err: reqwest::Error, duration: Duration) {
-    println!("Error {err} at {duration:?}, retrying");
+    warn!("Error {err} at {duration:?}, retrying");
 }
 
 impl RestBackend {
@@ -136,6 +154,7 @@ impl ReadBackend for RestBackend {
                     .header("Accept", "application/vnd.x.restic.rest.v2")
                     .send()
                     .await?
+                    .check_error()?
                     .json::<Vec<ListEntry>>()
                     .await?;
                 Ok(list.into_iter().map(|i| (i.name, i.size)).collect())
@@ -154,6 +173,7 @@ impl ReadBackend for RestBackend {
                     .get(self.url(tpe, id))
                     .send()
                     .await?
+                    .check_error()?
                     .bytes()
                     .await?
                     .into_iter()
@@ -183,6 +203,7 @@ impl ReadBackend for RestBackend {
                     .header("Range", header_value.clone())
                     .send()
                     .await?
+                    .check_error()?
                     .bytes()
                     .await?
                     .into_iter()
@@ -203,7 +224,8 @@ impl WriteBackend for RestBackend {
                 self.client
                     .post(self.url.join("?create=true").unwrap())
                     .send()
-                    .await?;
+                    .await?
+                    .check_error()?;
                 Ok(())
             },
             notify,
@@ -218,12 +240,17 @@ impl WriteBackend for RestBackend {
         _cacheable: bool,
         buf: Bytes,
     ) -> Result<()> {
-        v3!("writing tpe: {:?}, id: {}", &tpe, &id);
+        trace!("writing tpe: {:?}, id: {}", &tpe, &id);
         let req_builder = self.client.post(self.url(tpe, id)).body(buf);
         Ok(backoff::future::retry_notify(
             self.backoff.clone(),
             || async {
-                req_builder.try_clone().unwrap().send().await?;
+                req_builder
+                    .try_clone()
+                    .unwrap()
+                    .send()
+                    .await?
+                    .check_error()?;
                 Ok(())
             },
             notify,
@@ -232,11 +259,15 @@ impl WriteBackend for RestBackend {
     }
 
     async fn remove(&self, tpe: FileType, id: &Id, _cacheable: bool) -> Result<()> {
-        v3!("removing tpe: {:?}, id: {}", &tpe, &id);
+        trace!("removing tpe: {:?}, id: {}", &tpe, &id);
         Ok(backoff::future::retry_notify(
             self.backoff.clone(),
             || async {
-                self.client.delete(self.url(tpe, id)).send().await?;
+                self.client
+                    .delete(self.url(tpe, id))
+                    .send()
+                    .await?
+                    .check_error()?;
                 Ok(())
             },
             notify,

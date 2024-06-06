@@ -1,16 +1,24 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use bytes::Bytes;
 use clap::Parser;
 use futures::{stream, StreamExt, TryStreamExt};
-use vlog::*;
+use indicatif::ProgressBar;
+use log::*;
+use tokio::task::spawn_blocking;
+use zstd::stream::decode_all;
 
 use super::{progress_bytes, progress_counter};
-use crate::backend::{Cache, DecryptReadBackend, FileType, ReadBackend};
+use crate::backend::{Cache, DecryptFullBackend, DecryptReadBackend, FileType, ReadBackend};
 use crate::blob::{BlobType, NodeType, TreeStreamerOnce};
+use crate::commands::helpers::progress_spinner;
+use crate::crypto::{hash, CryptoKey};
 use crate::id::Id;
 use crate::index::{IndexBackend, IndexCollector, IndexType, IndexedBackend};
-use crate::repo::{IndexFile, IndexPack, SnapshotFile};
+use crate::repo::{
+    IndexFile, IndexPack, PackHeader, PackHeaderLength, PackHeaderRef, SnapshotFile,
+};
 
 #[derive(Parser)]
 pub(super) struct Opts {
@@ -24,7 +32,7 @@ pub(super) struct Opts {
 }
 
 pub(super) async fn execute(
-    be: &(impl DecryptReadBackend + Unpin),
+    be: &(impl DecryptFullBackend + Unpin), // TODO: this should be a DecryptReadBackend; see check_pack()
     cache: &Option<Cache>,
     hot_be: &Option<impl ReadBackend>,
     raw_be: &impl ReadBackend,
@@ -32,7 +40,6 @@ pub(super) async fn execute(
 ) -> Result<()> {
     if !opts.trust_cache {
         if let Some(cache) = &cache {
-            v1!("checking snapshots and index in cache...");
             for file_type in [FileType::Snapshot, FileType::Index] {
                 // list files in order to clean up the cache
                 //
@@ -40,35 +47,56 @@ pub(super) async fn execute(
                 // TODO: Only list the files once...
                 let _ = be.list_with_size(file_type).await?;
 
-                check_cache_files(cache, raw_be, file_type).await?;
+                let p = progress_bytes(format!("checking {} in cache...", file_type.name()));
+                // TODO: Make concurrency (20) customizable
+                check_cache_files(20, cache, raw_be, file_type, p).await?;
             }
         }
     }
 
     if let Some(hot_be) = hot_be {
-        v1!("checking snapshots and index in hot repo...");
         for file_type in [FileType::Snapshot, FileType::Index] {
             check_hot_files(raw_be, hot_be, file_type).await?;
         }
     }
 
-    v1!("checking packs in index and from pack list...");
-    let index_collector = check_packs(be, hot_be).await?;
+    let index_collector = check_packs(be, hot_be, opts.read_data).await?;
 
     if !opts.trust_cache {
         if let Some(cache) = &cache {
-            v1!("checking packs in cache...");
-            check_cache_files(cache, raw_be, FileType::Pack).await?;
+            let p = progress_bytes("checking packs in cache...");
+            // TODO: Make concurrency (5) customizable
+            check_cache_files(5, cache, raw_be, FileType::Pack, p).await?;
         }
     }
 
-    let be = IndexBackend::new_from_index(be, index_collector.into_index());
+    let index_be = IndexBackend::new_from_index(be, index_collector.into_index());
 
-    v1!("checking snapshots and trees...");
-    check_snapshots(&be).await?;
+    check_snapshots(&index_be).await?;
 
     if opts.read_data {
-        unimplemented!()
+        let p = progress_counter("reading pack data...");
+        stream::iter(index_be.into_index().into_iter().map(|pack| {
+            let be = be.clone();
+            let p = p.clone();
+            (pack, be, p)
+        }))
+        // TODO: Make concurrency (4) customizable
+        .for_each_concurrent(4, |(pack, be, p)| async move {
+            let id = pack.id;
+            let data = be.read_full(FileType::Pack, &id).await.unwrap();
+            spawn_blocking(move || {
+                match check_pack(&be, pack, data) {
+                    Ok(()) => {}
+                    Err(err) => error!("Error reading pack {id} : {err}",),
+                }
+                p.inc(1);
+            })
+            .await
+            .unwrap()
+        })
+        .await;
+        p.finish();
     }
 
     Ok(())
@@ -79,6 +107,7 @@ async fn check_hot_files(
     be_hot: &impl ReadBackend,
     file_type: FileType,
 ) -> Result<()> {
+    let p = progress_spinner(format!("checking {} in hot repo...", file_type.name()));
     let mut files = be
         .list_with_size(file_type)
         .await?
@@ -89,28 +118,28 @@ async fn check_hot_files(
 
     for (id, size_hot) in files_hot {
         match files.remove(&id) {
-            None => eprintln!("hot file {} does not exist in repo", id.to_hex()),
-            Some(size) if size != size_hot => eprintln!(
-                "file {}: hot size: {}, actual size: {}",
-                id.to_hex(),
-                size_hot,
-                size
-            ),
+            None => error!("hot file Type: {file_type:?}, Id: {id} does not exist in repo",),
+            Some(size) if size != size_hot => {
+                error!("Type: {file_type:?}, Id: {id}: hot size: {size_hot}, actual size: {size}",)
+            }
             _ => {} //everything ok
         }
     }
 
     for (id, _) in files {
-        eprintln!("hot file {} is missing!", id.to_hex());
+        error!("hot file Type: {file_type:?}, Id: {id} is missing!",);
     }
+    p.finish();
 
     Ok(())
 }
 
 async fn check_cache_files(
+    concurrency: usize,
     cache: &Cache,
     be: &impl ReadBackend,
     file_type: FileType,
+    p: ProgressBar,
 ) -> Result<()> {
     let files = cache.list_with_size(file_type).await?;
 
@@ -118,7 +147,6 @@ async fn check_cache_files(
         return Ok(());
     }
 
-    let p = progress_bytes();
     let total_size = files.iter().map(|(_, size)| *size as u64).sum();
     p.set_length(total_size);
 
@@ -128,17 +156,22 @@ async fn check_cache_files(
         let p = p.clone();
         (file, cache, be, p)
     }))
-    .for_each_concurrent(5, |((id, size), cache, be, p)| async move {
+    .for_each_concurrent(concurrency, |((id, size), cache, be, p)| async move {
         // Read file from cache and from backend and compare
-        // TODO: Use (Async)Readers and compare using them!
-        let data_cached = cache.read_full(file_type, &id).await.unwrap();
-        let data = be.read_full(file_type, &id).await.unwrap();
-        if data_cached != data {
-            eprintln!(
-                "Cached file Type: {:?}, Id: {} is not identical to backend!",
-                file_type, id
-            );
+        match (
+            cache.read_full(file_type, &id).await,
+            be.read_full(file_type, &id).await,
+        ) {
+            (Err(err), _) => {
+                error!("Error reading cached file Type: {file_type:?}, Id: {id} : {err}",)
+            }
+            (_, Err(err)) => error!("Error reading file Type: {file_type:?}, Id: {id} : {err}",),
+            (Ok(data_cached), Ok(data)) if data_cached != data => {
+                error!("Cached file Type: {file_type:?}, Id: {id} is not identical to backend!",)
+            }
+            (Ok(_), Ok(_)) => {} // everything ok
         }
+
         p.inc(size as u64);
     })
     .await;
@@ -151,10 +184,15 @@ async fn check_cache_files(
 async fn check_packs(
     be: &impl DecryptReadBackend,
     hot_be: &Option<impl ReadBackend>,
+    read_data: bool,
 ) -> Result<IndexCollector> {
     let mut packs = HashMap::new();
     let mut tree_packs = HashMap::new();
-    let mut index_collector = IndexCollector::new(IndexType::FullTrees);
+    let mut index_collector = IndexCollector::new(if read_data {
+        IndexType::Full
+    } else {
+        IndexType::FullTrees
+    });
 
     let mut process_pack = |p: IndexPack| {
         let blob_type = p.blob_type();
@@ -170,14 +208,14 @@ async fn check_packs(
         blobs.sort_unstable();
         for blob in blobs {
             if blob.tpe != blob_type {
-                eprintln!(
-                    "pack {}: blob {} blob type does not match: {:?}, expected: {:?}",
+                error!(
+                    "pack {}: blob {} blob type does not match: type: {:?}, expected: {:?}",
                     p.id, blob.id, blob.tpe, blob_type
                 );
             }
 
             if blob.offset != expected_offset {
-                eprintln!(
+                error!(
                     "pack {}: blob {} offset in index: {}, expected: {}",
                     p.id, blob.id, blob.offset, expected_offset
                 );
@@ -186,8 +224,7 @@ async fn check_packs(
         }
     };
 
-    v1!("- reading index...");
-    let p = progress_counter();
+    let p = progress_counter("reading index...");
     let mut stream = be.stream_all::<IndexFile>(p.clone()).await?;
     while let Some(index) = stream.try_next().await? {
         let index = index.1;
@@ -202,12 +239,14 @@ async fn check_packs(
     p.finish();
 
     if let Some(hot_be) = hot_be {
-        v1!("- listing packs in hot repo...");
+        let p = progress_spinner("listing packs in hot repo...");
         check_packs_list(hot_be, tree_packs).await?;
+        p.finish();
     }
 
-    v1!("- listing packs...");
+    let p = progress_spinner("listing packs...");
     check_packs_list(be, packs).await?;
+    p.finish();
 
     Ok(index_collector)
 }
@@ -215,30 +254,23 @@ async fn check_packs(
 async fn check_packs_list(be: &impl ReadBackend, mut packs: HashMap<Id, u32>) -> Result<()> {
     for (id, size) in be.list_with_size(FileType::Pack).await? {
         match packs.remove(&id) {
-            None => eprintln!("pack {} not referenced in index", id.to_hex()),
-            Some(index_size) if index_size != size => eprintln!(
-                "pack {}: size computed by index: {}, actual size: {}",
-                id.to_hex(),
-                index_size,
-                size
-            ),
+            None => warn!("pack {id} not referenced in index"),
+            Some(index_size) if index_size != size => {
+                error!("pack {id}: size computed by index: {index_size}, actual size: {size}",)
+            }
             _ => {} //everything ok
         }
     }
 
     for (id, _) in packs {
-        eprintln!(
-            "pack {} is referenced by the index but not presend!",
-            id.to_hex()
-        );
+        error!("pack {id} is referenced by the index but not present!",);
     }
     Ok(())
 }
 
 // check if all snapshots and contained trees can be loaded and contents exist in the index
 async fn check_snapshots(index: &(impl IndexedBackend + Unpin)) -> Result<()> {
-    v1!(" - reading snapshots...");
-    let p = progress_counter();
+    let p = progress_counter("reading snapshots...");
     let snap_trees: Vec<_> = index
         .be()
         .stream_all::<SnapshotFile>(p.clone())
@@ -248,9 +280,8 @@ async fn check_snapshots(index: &(impl IndexedBackend + Unpin)) -> Result<()> {
         .await?;
     p.finish();
 
-    v1!(" - checking trees...");
-    let mut tree_streamer =
-        TreeStreamerOnce::new(index.clone(), snap_trees, progress_counter()).await?;
+    let p = progress_counter("checking trees...");
+    let mut tree_streamer = TreeStreamerOnce::new(index.clone(), snap_trees, p).await?;
     while let Some(item) = tree_streamer.try_next().await? {
         let (path, tree) = item;
         for node in tree.nodes() {
@@ -258,11 +289,11 @@ async fn check_snapshots(index: &(impl IndexedBackend + Unpin)) -> Result<()> {
                 NodeType::File => {
                     for (i, id) in node.content().iter().enumerate() {
                         if id.is_null() {
-                            eprintln!("file {:?} blob {} has null ID", path.join(node.name()), i);
+                            error!("file {:?} blob {} has null ID", path.join(node.name()), i);
                         }
 
                         if !index.has_data(id) {
-                            eprintln!(
+                            error!(
                                 "file {:?} blob {} is missig in index",
                                 path.join(node.name()),
                                 id
@@ -274,10 +305,10 @@ async fn check_snapshots(index: &(impl IndexedBackend + Unpin)) -> Result<()> {
                 NodeType::Dir => {
                     match node.subtree() {
                         None => {
-                            eprintln!("dir {:?} subtree does not exist", path.join(node.name()))
+                            error!("dir {:?} subtree does not exist", path.join(node.name()))
                         }
                         Some(tree) if tree.is_null() => {
-                            eprintln!("dir {:?} subtree has null ID", path.join(node.name()))
+                            error!("dir {:?} subtree has null ID", path.join(node.name()))
                         }
                         _ => {} // subtree is ok
                     }
@@ -285,6 +316,76 @@ async fn check_snapshots(index: &(impl IndexedBackend + Unpin)) -> Result<()> {
 
                 _ => {} // nothing to check
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_pack(
+    be: &impl DecryptFullBackend, // TODO: this should be a DecryptReadBackend; we just additionally need the key() method
+    index_pack: IndexPack,
+    mut data: Bytes,
+) -> Result<()> {
+    let id = index_pack.id;
+    let size = index_pack.pack_size();
+    if data.len() != size as usize {
+        error!(
+            "pack {id}: data size does not match expected size. Read: {} bytes, expected: {size} bytes",
+            data.len()
+        );
+        return Ok(());
+    }
+
+    let comp_id = hash(&data);
+    if id != comp_id {
+        error!("pack {id}: Hash mismatch. Computed hash: {comp_id}");
+        return Ok(());
+    }
+
+    // check header length
+    let header_len = PackHeaderRef::from_index_pack(&index_pack).size();
+    let pack_header_len = PackHeaderLength::from_binary(&data.split_off(data.len() - 4))?.to_u32();
+    if pack_header_len != header_len {
+        error!("pack {id}: Header length in pack file doesn't match index. In pack: {pack_header_len}, calculated: {header_len}");
+        return Ok(());
+    }
+
+    // check header
+    let header = be
+        .key()
+        .decrypt_data(&data.split_off(data.len() - header_len as usize))?;
+
+    let pack_blobs = PackHeader::from_binary(&header)?.into_blobs();
+    let mut blobs = index_pack.blobs;
+    blobs.sort_unstable_by_key(|b| b.offset);
+    if pack_blobs != blobs {
+        error!("pack {id}: Header from pack file does not match the index");
+        debug!("pack file header: {pack_blobs:?}");
+        debug!("index: {:?}", blobs);
+        return Ok(());
+    }
+
+    // check blobs
+    for blob in blobs {
+        let blob_id = blob.id;
+        let mut blob_data = be
+            .key()
+            .decrypt_data(&data.split_to(blob.length as usize))?;
+
+        // TODO: this is identical to backend/decrypt.rs; unify these two parts!
+        if let Some(length) = blob.uncompressed_length {
+            blob_data = decode_all(&*blob_data).unwrap();
+            if blob_data.len() != length.get() as usize {
+                error!("pack {id}, blob {blob_id}: Actual uncompressed length does not fit saved uncompressed length");
+                return Ok(());
+            }
+        }
+
+        let comp_id = hash(&blob_data);
+        if blob.id != comp_id {
+            error!("pack {id}, blob {blob_id}: Hash mismatch. Computed hash: {comp_id}");
+            return Ok(());
         }
     }
 
