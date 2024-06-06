@@ -9,10 +9,11 @@ use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 
 use super::{progress_counter, prune, table_with_titles, RusticConfig};
-use crate::backend::{Cache, DecryptFullBackend, FileType};
-use crate::repo::{
-    ConfigFile, SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion, StringList,
+use crate::backend::{DecryptWriteBackend, FileType};
+use crate::repofile::{
+    SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion, StringList,
 };
+use crate::repository::OpenRepository;
 
 #[derive(Parser)]
 #[clap(global_setting(AppSettings::DeriveDisplayOrder))]
@@ -55,12 +56,11 @@ struct ConfigOpts {
 }
 
 pub(super) fn execute(
-    be: &(impl DecryptFullBackend + Unpin),
-    cache: Option<Cache>,
+    repo: OpenRepository,
     mut opts: Opts,
-    config: ConfigFile,
     config_file: RusticConfig,
 ) -> Result<()> {
+    let be = &repo.dbe;
     // merge "forget" section from config file, if given
     config_file.merge_into("forget", &mut opts.config)?;
     // merge "snapshot-filter" section from config file, if given
@@ -152,12 +152,12 @@ pub(super) fn execute(
         ),
         (false, false) => {
             let p = progress_counter("removing snapshots...");
-            be.delete_list(FileType::Snapshot, true, forget_snaps.clone(), p)?;
+            be.delete_list(FileType::Snapshot, true, forget_snaps.iter(), p)?;
         }
     }
 
     if opts.prune {
-        prune::execute(be, cache, opts.prune_opts, config, forget_snaps)?;
+        prune::execute(repo, opts.prune_opts, forget_snaps)?;
     }
 
     Ok(())

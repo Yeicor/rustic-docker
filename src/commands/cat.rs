@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use indicatif::ProgressBar;
 
@@ -10,7 +10,8 @@ use crate::backend::{DecryptReadBackend, FileType};
 use crate::blob::{BlobType, Tree};
 use crate::id::Id;
 use crate::index::{IndexBackend, IndexedBackend};
-use crate::repo::{SnapshotFile, SnapshotFilter};
+use crate::repofile::{SnapshotFile, SnapshotFilter};
+use crate::repository::OpenRepository;
 
 #[derive(Parser)]
 pub(super) struct Opts {
@@ -50,11 +51,8 @@ struct TreeOpts {
     snap: String,
 }
 
-pub(super) fn execute(
-    be: &impl DecryptReadBackend,
-    opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
+pub(super) fn execute(repo: OpenRepository, opts: Opts, config_file: RusticConfig) -> Result<()> {
+    let be = &repo.dbe;
     match opts.command {
         Command::Config => cat_file(be, FileType::Config, IdOpt::default()),
         Command::Index(opt) => cat_file(be, FileType::Index, opt),
@@ -93,7 +91,8 @@ fn cat_tree(
     let (id, path) = opts.snap.split_once(':').unwrap_or((&opts.snap, ""));
     let snap = SnapshotFile::from_str(be, id, |sn| sn.matches(&opts.filter), progress_counter(""))?;
     let index = IndexBackend::new(be, progress_counter(""))?;
-    let id = Tree::subtree_id(&index, snap.tree, Path::new(path))?;
+    let node = Tree::node_from_path(&index, snap.tree, Path::new(path))?;
+    let id = node.subtree.ok_or_else(|| anyhow!("{path} is no dir"))?;
     let data = index.blob_from_backend(&BlobType::Tree, &id)?;
     println!("{}", String::from_utf8(data.to_vec())?);
 

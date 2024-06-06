@@ -3,9 +3,10 @@ use chrono::{Duration, Local};
 use clap::{AppSettings, Parser};
 
 use super::{progress_counter, RusticConfig};
-use crate::backend::{DecryptFullBackend, FileType};
+use crate::backend::{DecryptWriteBackend, FileType};
 use crate::id::Id;
-use crate::repo::{DeleteOption, SnapshotFile, SnapshotFilter, StringList};
+use crate::repofile::{DeleteOption, SnapshotFile, SnapshotFilter, StringList};
+use crate::repository::OpenRepository;
 
 #[derive(Parser)]
 #[clap(global_setting(AppSettings::DeriveDisplayOrder))]
@@ -69,11 +70,12 @@ pub(super) struct Opts {
 }
 
 pub(super) fn execute(
-    be: &impl DecryptFullBackend,
+    repo: OpenRepository,
     mut opts: Opts,
     config_file: RusticConfig,
 ) -> Result<()> {
     config_file.merge_into("snapshot-filter", &mut opts.filter)?;
+    let be = &repo.dbe;
 
     let snapshots = match opts.ids.is_empty() {
         true => SnapshotFile::all_from_backend(be, &opts.filter)?,
@@ -109,10 +111,10 @@ pub(super) fn execute(
         ),
         (false, false) => {
             let p = progress_counter("saving new snapshots...");
-            be.save_list(snapshots, p)?;
+            be.save_list(snapshots.iter(), p)?;
 
             let p = progress_counter("deleting old snapshots...");
-            be.delete_list(FileType::Snapshot, true, old_snap_ids, p)?;
+            be.delete_list(FileType::Snapshot, true, old_snap_ids.iter(), p)?;
         }
     }
     Ok(())

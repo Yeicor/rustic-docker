@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -125,7 +125,7 @@ impl WriteBackend for LocalBackend {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&filename)?;
+            .open(filename)?;
         file.set_len(buf.len().try_into()?)?;
         file.write_all(&buf)?;
         file.sync_all()?;
@@ -142,16 +142,16 @@ impl WriteBackend for LocalBackend {
 
 impl LocalBackend {
     pub fn remove_dir(&self, dirname: impl AsRef<Path>) -> Result<()> {
-        Ok(fs::remove_dir(dirname)?)
+        Ok(fs::remove_dir_all(dirname)?)
     }
 
     pub fn remove_file(&self, filename: impl AsRef<Path>) -> Result<()> {
-        Ok(fs::remove_file(&filename)?)
+        Ok(fs::remove_file(filename)?)
     }
 
     pub fn create_dir(&self, item: impl AsRef<Path>) -> Result<()> {
         let dirname = self.path.join(item);
-        fs::create_dir_all(&dirname)?;
+        fs::create_dir_all(dirname)?;
         Ok(())
     }
 
@@ -161,7 +161,7 @@ impl LocalBackend {
             set_file_mtime(&filename, mtime)?;
         }
         if let Some(atime) = meta.atime.map(|t| FileTime::from_system_time(t.into())) {
-            set_file_atime(&filename, atime)?;
+            set_file_atime(filename, atime)?;
         }
         Ok(())
     }
@@ -203,15 +203,19 @@ impl LocalBackend {
 
         if let Some(mode) = meta.mode() {
             let mode = map_mode_from_go(*mode);
-            std::fs::set_permissions(&filename, fs::Permissions::from_mode(mode))?;
+            std::fs::set_permissions(filename, fs::Permissions::from_mode(mode))?;
         }
         Ok(())
     }
 
-    pub fn create_file(&self, item: impl AsRef<Path>, size: u64) -> Result<()> {
+    // set_length sets the length of the given file. If it doesn't exist, create a new (empty) one with given length
+    pub fn set_length(&self, item: impl AsRef<Path>, size: u64) -> Result<()> {
         let filename = self.path.join(item);
-        let f = fs::File::create(filename)?;
-        f.set_len(size)?;
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(filename)?
+            .set_len(size)?;
         Ok(())
     }
 
@@ -249,7 +253,7 @@ impl LocalBackend {
 
     pub fn read_at(&self, item: impl AsRef<Path>, offset: u64, length: u64) -> Result<Bytes> {
         let filename = self.path.join(item);
-        let mut file = File::open(&filename)?;
+        let mut file = File::open(filename)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut vec = vec![0; length.try_into()?];
         file.read_exact(&mut vec)?;
@@ -275,7 +279,7 @@ impl LocalBackend {
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .open(&filename)?;
+            .open(filename)?;
         file.write_all_at(data, offset)?;
         Ok(())
     }
