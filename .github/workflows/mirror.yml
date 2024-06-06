@@ -57,6 +57,10 @@ jobs:
             echo "Processing branch or tag $bt..."
             git checkout "$bt"
             rsync -a --exclude='.git' --exclude='.github' ${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
+            bt_is_tag="false"
+            if git tag | grep "$bt" >/dev/null; then
+              bt_is_tag="true"
+            fi
             
             # Push the branch or tag
             cd ${GITHUB_WORKSPACE}/
@@ -65,7 +69,7 @@ jobs:
             git add -v .
             if [[ `git status --porcelain` ]]; then # Changes
               git commit -am "Automated sync of original sources"
-              if git tag | grep "$bt" >/dev/null; then
+              if [[ "$bt_is_tag" == "true" ]]; then
                 git tag "$bt"
               else
                 git branch -m "autobranchfortag_$bt" "$bt"
