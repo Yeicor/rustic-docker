@@ -15,7 +15,7 @@ use rayon::ThreadPoolBuilder;
 use super::rustic_config::RusticConfig;
 use super::{bytes, progress_bytes, progress_counter, warm_up_wait};
 use crate::backend::{DecryptReadBackend, FileType, LocalDestination};
-use crate::blob::{Node, NodeStreamer, NodeType, Tree};
+use crate::blob::{Node, NodeStreamer, NodeType, Tree, TreeStreamerOptions};
 use crate::commands::helpers::progress_spinner;
 use crate::crypto::hash;
 use crate::id::Id;
@@ -33,6 +33,9 @@ pub(super) struct Opts {
     #[clap(long, short = 'n')]
     dry_run: bool,
 
+    #[clap(flatten)]
+    streamer_opts: TreeStreamerOptions,
+
     /// Remove all files/dirs in destination which are not contained in snapshot.
     /// WARNING: Use with care, maybe first try this first with --dry-run?
     #[clap(long)]
@@ -43,7 +46,7 @@ pub(super) struct Opts {
     numeric_id: bool,
 
     /// Don't restore ownership (user/group)
-    #[clap(long, conflicts_with = "numeric_id")]
+    #[clap(long, conflicts_with = "numeric-id")]
     no_ownership: bool,
 
     /// Warm up needed data pack files by only requesting them without processing
@@ -284,7 +287,8 @@ fn allocate_and_collect(
         .filter_map(Result::ok); // TODO: print out the ignored error
     let mut next_dst = dst_iter.next();
 
-    let mut node_streamer = NodeStreamer::new(index.clone(), node)?;
+    let mut node_streamer =
+        NodeStreamer::new_with_glob(index.clone(), node, opts.streamer_opts.clone())?;
     let mut next_node = node_streamer.next().transpose()?;
 
     loop {
@@ -302,8 +306,9 @@ fn allocate_and_collect(
                 }
                 Ordering::Equal => {
                     // process existing node
-                    if node.is_dir() != dst.file_type().unwrap().is_dir()
-                        || (node.is_symlink() != dst.file_type().unwrap().is_symlink())
+                    if (node.is_dir() && !dst.file_type().unwrap().is_dir())
+                        || (node.is_file() && !dst.metadata().unwrap().is_file())
+                        || node.is_special()
                     {
                         // if types do not match, first remove the existing file
                         process_existing(dst)?;
@@ -325,7 +330,7 @@ fn allocate_and_collect(
     }
 
     if additional_existing {
-        warn!("Note: additionals entries exist in destination");
+        warn!("Note: additional entries exist in destination");
     }
 
     Ok((file_infos, stats))
@@ -409,7 +414,7 @@ fn restore_metadata(
     opts: &Opts,
 ) -> Result<()> {
     // walk over tree in repository and compare with tree in dest
-    let mut node_streamer = NodeStreamer::new(index, node)?;
+    let mut node_streamer = NodeStreamer::new_with_glob(index, node, opts.streamer_opts.clone())?;
     let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.next().transpose()? {
         match node.node_type() {
@@ -451,7 +456,7 @@ fn set_metadata(dest: &LocalDestination, path: &PathBuf, node: &Node, opts: &Opt
             .set_user_group(path, node.meta())
             .unwrap_or_else(|_| warn!("restore {:?}: setting User/Group failed.", path)),
     }
-    dest.set_permission(path, node.meta())
+    dest.set_permission(path, node)
         .unwrap_or_else(|_| warn!("restore {:?}: chmod failed.", path));
     dest.set_extended_attributes(path, &node.meta.extended_attributes)
         .unwrap_or_else(|_| warn!("restore {:?}: setting extended attributes failed.", path));

@@ -6,14 +6,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aho_corasick::AhoCorasick;
-use anyhow::{bail, Result};
+#[cfg(not(windows))]
+use anyhow::Context;
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
-use filetime::{set_file_atime, set_file_mtime, FileTime};
+use filetime::{set_symlink_file_times, FileTime};
 use log::*;
 #[cfg(not(windows))]
 use nix::sys::stat::{mknod, Mode, SFlag};
 #[cfg(not(windows))]
-use nix::unistd::{chown, Gid, Group, Uid, User};
+use nix::unistd::{fchownat, FchownatFlags, Gid, Group, Uid, User};
 use walkdir::WalkDir;
 
 use crate::repository::parse_command;
@@ -74,8 +76,10 @@ impl LocalBackend {
 }
 
 impl ReadBackend for LocalBackend {
-    fn location(&self) -> &str {
-        self.path.to_str().unwrap()
+    fn location(&self) -> String {
+        let mut location = "local:".to_string();
+        location.push_str(&self.path.to_string_lossy());
+        location
     }
 
     fn set_option(&mut self, option: &str, value: &str) -> Result<()> {
@@ -252,12 +256,15 @@ impl LocalDestination {
 
     pub fn set_times(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
         let filename = self.path(item);
-        if let Some(mtime) = meta.mtime.map(|t| FileTime::from_system_time(t.into())) {
-            set_file_mtime(&filename, mtime)?;
+        if let Some(mtime) = meta.mtime {
+            let atime = meta.atime.unwrap_or(mtime);
+            set_symlink_file_times(
+                filename,
+                FileTime::from_system_time(atime.into()),
+                FileTime::from_system_time(mtime.into()),
+            )?;
         }
-        if let Some(atime) = meta.atime.map(|t| FileTime::from_system_time(t.into())) {
-            set_file_atime(filename, atime)?;
-        }
+
         Ok(())
     }
 
@@ -285,8 +292,7 @@ impl LocalDestination {
             .and_then(|name| Group::from_name(name).unwrap());
         // use gid from group if valid, else from saved gid (if saved)
         let gid = group.map(|g| g.gid).or_else(|| meta.gid.map(Gid::from_raw));
-
-        chown(&filename, uid, gid)?;
+        fchownat(None, &filename, uid, gid, FchownatFlags::NoFollowSymlink)?;
         Ok(())
     }
 
@@ -303,28 +309,32 @@ impl LocalDestination {
         let uid = meta.uid.map(Uid::from_raw);
         let gid = meta.gid.map(Gid::from_raw);
 
-        chown(&filename, uid, gid)?;
+        fchownat(None, &filename, uid, gid, FchownatFlags::NoFollowSymlink)?;
         Ok(())
     }
 
     #[cfg(windows)]
     // TODO
-    pub fn set_permission(&self, _item: impl AsRef<Path>, _meta: &Metadata) -> Result<()> {
+    pub fn set_permission(&self, _item: impl AsRef<Path>, _node: &Node) -> Result<()> {
         Ok(())
     }
 
     #[cfg(not(windows))]
-    pub fn set_permission(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
+    pub fn set_permission(&self, item: impl AsRef<Path>, node: &Node) -> Result<()> {
+        if node.node_type.is_symlink() {
+            return Ok(());
+        }
+
         let filename = self.path(item);
 
-        if let Some(mode) = meta.mode() {
+        if let Some(mode) = node.meta.mode() {
             let mode = map_mode_from_go(*mode);
             std::fs::set_permissions(filename, fs::Permissions::from_mode(mode))?;
         }
         Ok(())
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "openbsd"))]
     pub fn set_extended_attributes(
         &self,
         _item: impl AsRef<Path>,
@@ -333,29 +343,55 @@ impl LocalDestination {
         Ok(())
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "openbsd")))]
     pub fn set_extended_attributes(
         &self,
         item: impl AsRef<Path>,
         extended_attributes: &[ExtendedAttribute],
     ) -> Result<()> {
         let filename = self.path(item);
+        let mut done = vec![false; extended_attributes.len()];
 
-        for name in xattr::list(&filename)? {
-            if let Err(err) = xattr::remove(&filename, &name) {
-                warn!("error removing xattr on {filename:?}: {err}");
+        for curr_name in
+            xattr::list(&filename).with_context(|| format!("listing xattrs on {filename:?}"))?
+        {
+            match extended_attributes.iter().enumerate().find(
+                |(_, ExtendedAttribute { name, .. })| name == curr_name.to_string_lossy().as_ref(),
+            ) {
+                Some((index, ExtendedAttribute { name, value })) => {
+                    let curr_value = xattr::get(&filename, name)?.unwrap();
+                    if value != &curr_value {
+                        xattr::set(&filename, name, value)
+                            .with_context(|| format!("setting xattr {name} on {filename:?}"))?;
+                    }
+                    done[index] = true;
+                }
+                None => {
+                    if let Err(err) = xattr::remove(&filename, &curr_name) {
+                        warn!("error removing xattr {curr_name:?} on {filename:?}: {err}");
+                    }
+                }
             }
         }
 
-        for ExtendedAttribute { name, value } in extended_attributes {
-            xattr::set(&filename, name, value)?;
+        for (index, ExtendedAttribute { name, value }) in extended_attributes.iter().enumerate() {
+            if !done[index] {
+                xattr::set(&filename, name, value)
+                    .with_context(|| format!("setting xattr {name} on {filename:?}"))?;
+            }
         }
+
         Ok(())
     }
 
     // set_length sets the length of the given file. If it doesn't exist, create a new (empty) one with given length
     pub fn set_length(&self, item: impl AsRef<Path>, size: u64) -> Result<()> {
         let filename = self.path(item);
+        let dir = filename
+            .parent()
+            .ok_or_else(|| anyhow!("file {filename:?} should have a parent"))?;
+        fs::create_dir_all(dir)?;
+
         OpenOptions::new()
             .create(true)
             .write(true)
