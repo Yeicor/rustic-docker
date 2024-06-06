@@ -37,6 +37,8 @@ jobs:
           find ${GITHUB_WORKSPACE}/
           # Copy all files from the original repository
           rsync -a --exclude='.git' ${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
+          # - Removing original workflows
+          find ${GITHUB_WORKSPACE}/.github/workflows/ -type f -not \( -path "${GITHUB_WORKSPACE}/.github/workflows/yeicor-*" \) -delete
           git config --global user.name 'yeicor-mirror.yml'
           git config --global user.email 'Yeicor@users.noreply.github.com'
           git add -v .
