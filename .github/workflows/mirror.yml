@@ -75,6 +75,7 @@ jobs:
               else
                 git branch -m "autobranchfortag_$bt" "$bt"
               fi
+              git push origin "autobranchfortag_$bt"
               git push -f origin $bt
               updated_refs="${updated_refs}\"$bt\","
               echo "Changes pushed..."
