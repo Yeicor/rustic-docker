@@ -26,6 +26,10 @@ pub(super) struct Opts {
     #[clap(long)]
     delete: bool,
 
+    /// use numeric ids instead of user/groug when restoring uid/gui
+    #[clap(long)]
+    numeric_id: bool,
+
     /// snapshot to restore
     id: String,
 
@@ -39,13 +43,13 @@ pub(super) async fn execute(be: &(impl DecryptReadBackend + Unpin), opts: Opts) 
     let dest = LocalBackend::new(&opts.dest);
     let index = IndexBackend::new(be, progress_counter()).await?;
 
-    v2!("1st tree walk: allocating dirs/files and collecting restore information...");
+    v1!("allocating dirs/files and collecting restore information...");
     let file_infos = allocate_and_collect(&dest, index.clone(), snap.tree, &opts).await?;
 
-    v2!("restoring file contents...");
+    v1!("restoring file contents...");
     restore_contents(be, &dest, file_infos, &opts).await?;
 
-    v2!("2nd tree walk: setting metadata");
+    v1!("setting metadata...");
     restore_metadata(&dest, index, snap.tree, &opts).await?;
 
     v1!("done.");
@@ -63,10 +67,11 @@ async fn allocate_and_collect(
 
     let mut node_streamer = NodeStreamer::new(index.clone(), tree).await?;
     while let Some((path, node)) = node_streamer.try_next().await? {
+        v3!("processing {:?}", path);
         match node.node_type() {
             NodeType::Dir => {
                 if !opts.dry_run {
-                    dest.create_dir(&path);
+                    dest.create_dir(&path)?;
                 }
             }
             NodeType::File => {
@@ -74,7 +79,7 @@ async fn allocate_and_collect(
                 let size = file_infos.add_file(&node, path.clone(), &index)?;
                 // create the file
                 if !opts.dry_run {
-                    dest.create_file(&path, size);
+                    dest.create_file(&path, size)?;
                 }
             }
             _ => {} // nothing to do for symlink, device, etc.
@@ -97,8 +102,9 @@ async fn restore_contents(
     v1!("processing blobs...");
     let p = progress_counter();
     p.set_length(restore_info.iter().map(|(_, blob)| blob.len() as u64).sum());
-    let stream = FuturesUnordered::new();
+    let mut stream = FuturesUnordered::new();
 
+    const MAX_READER: usize = 20;
     for (pack, blob) in restore_info {
         for (bl, fls) in blob {
             let p = p.clone();
@@ -110,11 +116,15 @@ async fn restore_contents(
                 .map(|fl| (filenames[fl.file_idx].clone(), fl.file_start))
                 .collect();
 
+            while stream.len() > MAX_READER {
+                stream.try_next().await?;
+            }
+
             // TODO: error handling!
             stream.push(spawn(async move {
                 // read pack at blob_offset with length blob_length
                 let data = be
-                    .read_encrypted_partial(FileType::Pack, &pack, bl.offset, bl.length)
+                    .read_encrypted_partial(FileType::Pack, &pack, false, bl.offset, bl.length)
                     .await
                     .unwrap();
 
@@ -126,7 +136,7 @@ async fn restore_contents(
                 if !dry_run {
                     // save into needed files in parallel
                     for (name, start) in name_dests {
-                        dest.write_at(&name, start, &data);
+                        dest.write_at(&name, start, &data).unwrap();
                     }
                 }
                 p.inc(1);
@@ -148,17 +158,53 @@ async fn restore_metadata(
 ) -> Result<()> {
     // walk over tree in repository and compare with tree in dest
     let mut node_streamer = NodeStreamer::new(index, tree).await?;
+    let mut dir_stack = Vec::new();
     while let Some((path, node)) = node_streamer.try_next().await? {
         if !opts.dry_run {
-            if let NodeType::Symlink { linktarget } = node.node_type() {
-                dest.create_symlink(&path, linktarget);
+            match node.node_type() {
+                NodeType::Dir => {
+                    // set metadata for all non-parent paths in stack
+                    while let Some((stackpath, _)) = dir_stack.last() {
+                        if !path.starts_with(stackpath) {
+                            let (path, node) = dir_stack.pop().unwrap();
+                            set_metadata(dest, &path, &node, opts);
+                        } else {
+                            break;
+                        }
+                    }
+                    // push current path to the stack
+                    dir_stack.push((path, node));
+                }
+                _ => set_metadata(dest, &path, &node, opts),
             }
-            dest.set_metadata(&path, node.meta());
         }
+    }
+
+    // empty dir stack and set metadata
+    for (path, node) in dir_stack.into_iter().rev() {
+        set_metadata(dest, &path, &node, opts);
     }
 
     Ok(())
 }
+
+fn set_metadata(dest: &LocalBackend, path: &PathBuf, node: &Node, opts: &Opts) {
+    v3!("processing {:?}", path);
+    dest.create_special(path, node)
+        .unwrap_or_else(|_| eprintln!("restore {:?}: creating special file failed.", path));
+    if opts.numeric_id {
+        dest.set_uid_gid(path, node.meta())
+            .unwrap_or_else(|_| eprintln!("restore {:?}: setting UID/GID failed.", path));
+    } else {
+        dest.set_user_group(path, node.meta())
+            .unwrap_or_else(|_| eprintln!("restore {:?}: setting User/Group failed.", path));
+    }
+    dest.set_permission(path, node.meta())
+        .unwrap_or_else(|_| eprintln!("restore {:?}: chmod failed.", path));
+    dest.set_times(path, node.meta())
+        .unwrap_or_else(|_| eprintln!("restore {:?}: setting file times failed.", path));
+}
+
 /// struct that contains information of file contents grouped by
 /// 1) pack ID,
 /// 2) blob within this pack

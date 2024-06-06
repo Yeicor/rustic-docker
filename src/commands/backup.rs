@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use chrono::{Duration, Local};
 use clap::Parser;
 use gethostname::gethostname;
@@ -13,7 +13,6 @@ use crate::backend::{
     DecryptFullBackend, DecryptWriteBackend, DryRunBackend, LocalSource, LocalSourceOptions,
     ReadSource,
 };
-use crate::id::Id;
 use crate::index::IndexBackend;
 use crate::repo::{ConfigFile, DeleteOption, SnapshotFile, SnapshotSummary, StringList};
 
@@ -53,17 +52,11 @@ pub(super) struct Opts {
 pub(super) async fn execute(
     be: &impl DecryptFullBackend,
     opts: Opts,
-    config_id: &Id,
+    config: ConfigFile,
     command: String,
 ) -> Result<()> {
     let time = Local::now();
-    let config: ConfigFile = be.get_file(config_id).await?;
-    let poly = config.poly()?;
-    let zstd = match config.version {
-        1 => None,
-        2 => Some(0),
-        _ => bail!("config version not supported!"),
-    };
+    let zstd = config.zstd()?;
     let mut be = DryRunBackend::new(be.clone(), opts.dry_run);
     be.set_zstd(zstd);
 
@@ -135,9 +128,8 @@ pub(super) async fn execute(
     } else {
         0
     };
-
     v1!("starting backup...");
-    let mut archiver = Archiver::new(be, index, poly, parent, snap, zstd)?;
+    let mut archiver = Archiver::new(be, index, &config, parent, snap)?;
     let p = progress_bytes();
     p.set_length(size);
     for item in src {
