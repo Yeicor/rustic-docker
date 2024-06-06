@@ -61,8 +61,12 @@ pub(super) fn execute(repo: OpenRepository, opts: Opts) -> Result<()> {
 
     let index_collector = check_packs(be, hot_be, opts.read_data)?;
 
-    if !opts.trust_cache {
-        if let Some(cache) = &cache {
+    if let Some(cache) = &cache {
+        let p = progress_spinner("cleaning up packs from cache...");
+        cache.remove_not_in_list(FileType::Pack, index_collector.tree_packs())?;
+        p.finish();
+
+        if !opts.trust_cache {
             let p = progress_bytes("checking packs in cache...");
             // TODO: Make concurrency (5) customizable
             check_cache_files(5, cache, raw_be, FileType::Pack, p)?;
@@ -110,9 +114,9 @@ fn check_hot_files(
 
     for (id, size_hot) in files_hot {
         match files.remove(&id) {
-            None => error!("hot file Type: {file_type:?}, Id: {id} does not exist in repo",),
+            None => error!("hot file Type: {file_type:?}, Id: {id} does not exist in repo"),
             Some(size) if size != size_hot => {
-                error!("Type: {file_type:?}, Id: {id}: hot size: {size_hot}, actual size: {size}",)
+                error!("Type: {file_type:?}, Id: {id}: hot size: {size_hot}, actual size: {size}");
             }
             _ => {} //everything ok
         }
@@ -139,28 +143,33 @@ fn check_cache_files(
         return Ok(());
     }
 
-    let total_size = files.values().map(|size| *size as u64).sum();
+    let total_size = files.values().map(|size| u64::from(*size)).sum();
     p.set_length(total_size);
 
-    files.into_par_iter()
-    .for_each_with((cache,be,p.clone()), |(cache, be, p),(id, size)|  {
-        // Read file from cache and from backend and compare
-        match (
-            cache.read_full(file_type, &id),
-            be.read_full(file_type, &id),
-        ) {
-            (Err(err), _) => {
-                error!("Error reading cached file Type: {file_type:?}, Id: {id} : {err}",)
+    files
+        .into_par_iter()
+        .for_each_with((cache, be, p.clone()), |(cache, be, p), (id, size)| {
+            // Read file from cache and from backend and compare
+            match (
+                cache.read_full(file_type, &id),
+                be.read_full(file_type, &id),
+            ) {
+                (Err(err), _) => {
+                    error!("Error reading cached file Type: {file_type:?}, Id: {id} : {err}");
+                }
+                (_, Err(err)) => {
+                    error!("Error reading file Type: {file_type:?}, Id: {id} : {err}");
+                }
+                (Ok(data_cached), Ok(data)) if data_cached != data => {
+                    error!(
+                        "Cached file Type: {file_type:?}, Id: {id} is not identical to backend!"
+                    );
+                }
+                (Ok(_), Ok(_)) => {} // everything ok
             }
-            (_, Err(err)) => error!("Error reading file Type: {file_type:?}, Id: {id} : {err}",),
-            (Ok(data_cached), Ok(data)) if data_cached != data => {
-                error!("Cached file Type: {file_type:?}, Id: {id} is not identical to backend!",)
-            }
-            (Ok(_), Ok(_)) => {} // everything ok
-        }
 
-        p.inc(size as u64);
-    });
+            p.inc(u64::from(size));
+        });
 
     p.finish();
     Ok(())
@@ -242,7 +251,7 @@ fn check_packs_list(be: &impl ReadBackend, mut packs: HashMap<Id, u32>) -> Resul
         match packs.remove(&id) {
             None => warn!("pack {id} not referenced in index. Can be a parallel backup job. To repair: 'rustic repair index'."),
             Some(index_size) if index_size != size => {
-                error!("pack {id}: size computed by index: {index_size}, actual size: {size}. To repair: 'rustic repair index'.")
+                error!("pack {id}: size computed by index: {index_size}, actual size: {size}. To repair: 'rustic repair index'.");
             }
             _ => {} //everything ok
         }
@@ -290,10 +299,10 @@ fn check_snapshots(index: &impl IndexedBackend) -> Result<()> {
                 NodeType::Dir => {
                     match node.subtree() {
                         None => {
-                            error!("dir {:?} subtree does not exist", path.join(node.name()))
+                            error!("dir {:?} subtree does not exist", path.join(node.name()));
                         }
                         Some(tree) if tree.is_null() => {
-                            error!("dir {:?} subtree has null ID", path.join(node.name()))
+                            error!("dir {:?} subtree has null ID", path.join(node.name()));
                         }
                         _ => {} // subtree is ok
                     }

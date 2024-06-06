@@ -14,7 +14,7 @@ use log::*;
 use rayon::ThreadPoolBuilder;
 
 use super::rustic_config::RusticConfig;
-use super::{bytes, progress_bytes, progress_counter, wait, warm_up, warm_up_command};
+use super::{bytes, progress_bytes, progress_counter, warm_up_wait};
 use crate::backend::{DecryptReadBackend, FileType, LocalBackend};
 use crate::blob::{Node, NodeStreamer, NodeType, Tree};
 use crate::commands::helpers::progress_spinner;
@@ -78,9 +78,9 @@ pub(super) fn execute(
 
     if let Some(command) = &opts.warm_up_command {
         if !command.contains("%id") {
-            bail!("warm-up command must contain %id!")
+            bail!("warm-up command must contain %id!");
         }
-        info!("using warm-up command {command}")
+        info!("using warm-up command {command}");
     }
 
     let (id, path) = opts.snap.split_once(':').unwrap_or((&opts.snap, ""));
@@ -117,15 +117,7 @@ pub(super) fn execute(
     if file_infos.restore_size == 0 {
         info!("all file contents are fine.");
     } else {
-        if opts.warm_up {
-            warm_up(be, file_infos.to_packs().into_iter())?;
-        } else if opts.warm_up_command.is_some() {
-            warm_up_command(
-                file_infos.to_packs().into_iter(),
-                opts.warm_up_command.as_ref().unwrap(),
-            )?;
-        }
-        wait(opts.warm_up_wait);
+        warm_up_wait(&repo, file_infos.to_packs().into_iter(), !opts.dry_run)?;
         if !opts.dry_run {
             restore_contents(be, &dest, file_infos)?;
         }
@@ -188,10 +180,10 @@ fn allocate_and_collect(
             entry.file_type().unwrap().is_dir(),
         ) {
             (true, true, true) => {
-                info!("would have removed the additional dir: {:?}", entry.path())
+                info!("would have removed the additional dir: {:?}", entry.path());
             }
             (true, true, false) => {
-                info!("would have removed the additional file: {:?}", entry.path())
+                info!("would have removed the additional file: {:?}", entry.path());
             }
             (true, false, true) => {
                 let path = entry.path();
@@ -331,8 +323,8 @@ fn allocate_and_collect(
     Ok((file_infos, stats))
 }
 
-/// restore_contents restores all files contents as described by file_infos
-/// using the ReadBackend be and writing them into the LocalBackend dest.
+/// [`restore_contents`] restores all files contents as described by `file_infos`
+/// using the [`DecryptReadBackend`] `be` and writing them into the [`LocalBackend`] `dest`.
 fn restore_contents(
     be: &impl DecryptReadBackend,
     dest: &LocalBackend,
@@ -391,7 +383,7 @@ fn restore_contents(
                                 p.inc(size);
                             });
                         }
-                    })
+                    });
                 }
             }
         }
@@ -511,7 +503,7 @@ impl FileInfos {
         }
     }
 
-    /// Add the file to FilesInfos using index to get blob information.
+    /// Add the file to [`FileInfos`] using `index` to get blob information.
     /// Returns the computed length of the file
     fn add_file(
         &mut self,

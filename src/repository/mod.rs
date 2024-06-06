@@ -3,12 +3,22 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use log::*;
 use merge::Merge;
+use nom::{
+    branch::alt,
+    bytes::complete::{is_not, tag},
+    character::complete::multispace1,
+    error::ParseError,
+    multi::separated_list0,
+    sequence::delimited,
+    IResult,
+};
 use rpassword::{prompt_password, read_password_from_bufread};
 use serde::Deserialize;
+use serde_with::{serde_as, DisplayFromStr};
 
 use crate::backend::{
     Cache, CachedBackend, ChooseBackend, DecryptBackend, DecryptReadBackend, DecryptWriteBackend,
@@ -17,6 +27,7 @@ use crate::backend::{
 use crate::crypto::Key;
 use crate::repofile::{find_key_in_backend, ConfigFile};
 
+#[serde_as]
 #[derive(Default, Parser, Deserialize, Merge)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct RepositoryOptions {
@@ -66,6 +77,36 @@ pub struct RepositoryOptions {
         env = "RUSTIC_CACHE_DIR"
     )]
     cache_dir: Option<PathBuf>,
+
+    /// Warm up needed data pack files by only requesting them without processing
+    #[clap(long, global = true)]
+    #[merge(strategy = merge::bool::overwrite_false)]
+    pub(crate) warm_up: bool,
+
+    /// Warm up needed data pack files by running the command with %id replaced by pack id
+    #[clap(long, global = true, conflicts_with = "warm-up")]
+    pub(crate) warm_up_command: Option<String>,
+
+    /// Duration (e.g. 10m) to wait after warm up
+    #[clap(long, global = true, value_name = "DURATION")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub(crate) warm_up_wait: Option<humantime::Duration>,
+}
+
+// parse a command
+pub(crate) fn parse_command<'a, E: ParseError<&'a str>>(
+    input: &'a str,
+) -> IResult<&'a str, Vec<&'a str>, E> {
+    separated_list0(
+        // a command is a list
+        multispace1, // separated by one or more spaces
+        alt((
+            // and containing either
+            delimited(tag("\""), is_not("\""), tag("\"")), // strings wrapped in "", or
+            delimited(tag("'"), is_not("'"), tag("'")),    // strigns wrapped in '', or
+            is_not(" \t\r\n"),                             // strings not containing any space
+        )),
+    )(input)
 }
 
 pub struct Repository {
@@ -111,35 +152,59 @@ impl Repository {
         ) {
             (Some(pwd), _, _) => Ok(Some(pwd.clone())),
             (_, Some(file), _) => {
-                let mut file = BufReader::new(File::open(file)?);
-                Ok(Some(read_password_from_bufread(&mut file)?))
+                let mut file = BufReader::new(
+                    File::open(file)
+                        .with_context(|| format!("error opening password file {file:?}"))?,
+                );
+                Ok(Some(
+                    read_password_from_bufread(&mut file).context("error reading password file")?,
+                ))
             }
             (_, _, Some(command)) => {
-                let mut commands: Vec<_> = command.split(' ').collect();
+                let mut commands = parse_command::<()>(command)?.1;
+                debug!("commands: {commands:?}");
                 let output = Command::new(commands[0])
                     .args(&mut commands[1..])
-                    .output()?;
+                    .output()
+                    .with_context(|| format!("failed to call password command {commands:?}"))?;
 
                 let mut pwd = BufReader::new(&*output.stdout);
-                Ok(Some(read_password_from_bufread(&mut pwd)?))
+                Ok(Some(
+                    read_password_from_bufread(&mut pwd)
+                        .context("error reading password from command")?,
+                ))
             }
             (None, None, None) => Ok(None),
         }
     }
 
     pub fn open(self) -> Result<OpenRepository> {
-        let config_ids = self.be.list(FileType::Config)?;
+        let config_ids = self
+            .be
+            .list(FileType::Config)
+            .context("error listing the repo config file")?;
 
         match config_ids.len() {
             1 => {} // ok, continue
-            0 => bail!("No config file found. Is there a repo at {}?", self.name),
-            _ => bail!("More than one config file at {}. Aborting.", self.name),
+            0 => bail!(
+                "No repository config file found. Is there a repo at {}?",
+                self.name
+            ),
+            _ => bail!(
+                "More than one repository config file at {}. Aborting.",
+                self.name
+            ),
         }
 
         if let Some(be_hot) = &self.be_hot {
-            let mut keys = self.be.list_with_size(FileType::Key)?;
+            let mut keys = self
+                .be
+                .list_with_size(FileType::Key)
+                .context("error listing the repo keys")?;
             keys.sort_unstable_by_key(|key| key.0);
-            let mut hot_keys = be_hot.list_with_size(FileType::Key)?;
+            let mut hot_keys = be_hot
+                .list_with_size(FileType::Key)
+                .context("error listing the hot repo keys")?;
             hot_keys.sort_unstable_by_key(|key| key.0);
             if keys != hot_keys {
                 bail!(
@@ -153,14 +218,16 @@ impl Repository {
         info!("repository {}: password is correct.", self.name);
 
         let dbe = DecryptBackend::new(&self.be, key.clone());
-        let config: ConfigFile = dbe.get_file(&config_ids[0])?;
+        let config: ConfigFile = dbe
+            .get_file(&config_ids[0])
+            .context("error accessing config file")?;
         match (config.is_hot == Some(true), self.be_hot.is_some()) {
                 (true, false) => bail!("repository is a hot repository!\nPlease use as --repo-hot in combination with the normal repo. Aborting."),
                 (false, true) => bail!("repo-hot is not a hot repository! Aborting."),
                 _ => {}
             }
         let cache = (!self.opts.no_cache)
-            .then(|| Cache::new(config.id, self.opts.cache_dir).ok())
+            .then(|| Cache::new(config.id, self.opts.cache_dir.clone()).ok())
             .flatten();
         match &cache {
             None => info!("using no cache"),
@@ -179,6 +246,7 @@ impl Repository {
             be: self.be,
             be_hot: self.be_hot,
             config,
+            opts: self.opts,
         })
     }
 }
@@ -191,6 +259,7 @@ pub struct OpenRepository {
     pub(crate) cache: Option<Cache>,
     pub(crate) dbe: DecryptBackend<CachedBackend<HotColdBackend<ChooseBackend>>, Key>,
     pub(crate) config: ConfigFile,
+    pub(crate) opts: RepositoryOptions,
 }
 
 const MAX_PASSWORD_RETRIES: usize = 5;

@@ -36,7 +36,7 @@ impl Tree {
     }
 
     pub fn add(&mut self, node: Node) {
-        self.nodes.push(node)
+        self.nodes.push(node);
     }
 
     pub fn serialize(&self) -> Result<(Vec<u8>, Id)> {
@@ -49,7 +49,7 @@ impl Tree {
     pub fn from_backend(be: &impl IndexedBackend, id: Id) -> Result<Self> {
         let data = be
             .get_tree(&id)
-            .ok_or_else(|| anyhow!("blob {} not found in index", id.to_hex()))?
+            .ok_or_else(|| anyhow!("blob {id:?} not found in index"))?
             .read_data(be.be())?;
 
         Ok(serde_json::from_slice(&data)?)
@@ -86,7 +86,7 @@ impl IntoIterator for Tree {
     }
 }
 
-/// NodeStreamer recursively streams all nodes of a given tree including all subtrees in-order
+/// [`NodeStreamer`] recursively streams all nodes of a given tree including all subtrees in-order
 pub struct NodeStreamer<BE>
 where
     BE: IndexedBackend,
@@ -157,7 +157,7 @@ where
     }
 }
 
-/// TreeStreamerOnce recursively visits all trees and subtrees, but each tree ID only once
+/// [`TreeStreamerOnce`] recursively visits all trees and subtrees, but each tree ID only once
 pub struct TreeStreamerOnce {
     visited: HashSet<Id>,
     queue_in: Option<Sender<(PathBuf, Id, usize)>>,

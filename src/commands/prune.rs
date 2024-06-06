@@ -12,7 +12,7 @@ use itertools::Itertools;
 use log::*;
 use rayon::prelude::*;
 
-use super::{bytes, no_progress, progress_bytes, progress_counter, wait, warm_up, warm_up_command};
+use super::{bytes, no_progress, progress_bytes, progress_counter, warm_up_wait};
 use crate::backend::{DecryptReadBackend, DecryptWriteBackend, FileType, ReadBackend};
 use crate::blob::{
     BlobType, BlobTypeMap, Initialize, NodeType, PackSizer, Repacker, Sum, TreeStreamerOnce,
@@ -53,10 +53,6 @@ pub(super) struct Opts {
     #[clap(long)]
     instant_delete: bool,
 
-    /// Only remove unneded pack file from local cache. Do not change the repository at all.
-    #[clap(long)]
-    cache_only: bool,
-
     /// Simply copy blobs when repacking instead of decrypting; possibly compressing; encrypting
     #[clap(long)]
     fast_repack: bool,
@@ -73,18 +69,6 @@ pub(super) struct Opts {
     /// Do not repack packs which only needs to be resized
     #[clap(long)]
     no_resize: bool,
-
-    /// Warm up needed data pack files by only requesting them without processing
-    #[clap(long)]
-    warm_up: bool,
-
-    /// Warm up needed data pack files by running the command with %id replaced by pack id
-    #[clap(long, conflicts_with = "warm-up")]
-    warm_up_command: Option<String>,
-
-    /// Duration (e.g. 10m) to wait after warm up before doing the actual restore
-    #[clap(long, value_name = "DURATION", conflicts_with = "dry-run")]
-    warm_up_wait: Option<humantime::Duration>,
 }
 
 pub(super) fn execute(repo: OpenRepository, opts: Opts, ignore_snaps: Vec<Id>) -> Result<()> {
@@ -105,27 +89,13 @@ pub(super) fn execute(repo: OpenRepository, opts: Opts, ignore_snaps: Vec<Id>) -
         // used blobs doesn't abort if they are already marked for deletion
         index_collector.extend(index.packs_to_delete.clone());
 
-        index_files.push((id, index))
+        index_files.push((id, index));
     }
     p.finish();
 
-    if let Some(cache) = &repo.cache {
-        let p = progress_spinner("cleaning up packs from cache...");
-        cache.remove_not_in_list(FileType::Pack, index_collector.tree_packs())?;
-        p.finish();
-    }
-    match (repo.cache.is_some(), opts.cache_only) {
-        (true, true) => return Ok(()),
-        (false, true) => {
-            warn!("Warning: option --cache-only used without a cache.");
-            return Ok(());
-        }
-        _ => {}
-    }
-
     let (used_ids, total_size) = {
         let index = index_collector.into_index();
-        let total_size = BlobTypeMap::init(|blob_type| index.total_size(&blob_type));
+        let total_size = BlobTypeMap::init(|blob_type| index.total_size(blob_type));
         let indexed_be = IndexBackend::new_from_index(&be.clone(), index);
         let used_ids = find_used_blobs(&indexed_be, ignore_snaps)?;
         (used_ids, total_size)
@@ -161,15 +131,7 @@ pub(super) fn execute(repo: OpenRepository, opts: Opts, ignore_snaps: Vec<Id>) -
     pruner.filter_index_files(opts.instant_delete);
     pruner.print_stats();
 
-    if opts.warm_up {
-        warm_up(be, pruner.repack_packs().into_iter())?;
-    } else if opts.warm_up_command.is_some() {
-        warm_up_command(
-            pruner.repack_packs().into_iter(),
-            opts.warm_up_command.as_ref().unwrap(),
-        )?;
-    }
-    wait(opts.warm_up_wait);
+    warm_up_wait(&repo, pruner.repack_packs().into_iter(), !opts.dry_run)?;
 
     if !opts.dry_run {
         pruner.do_prune(repo, opts)?;
@@ -329,41 +291,41 @@ impl PrunePack {
         match todo {
             PackToDo::Undecided => panic!("not possible"),
             PackToDo::Keep => {
-                stats.blobs[tpe].used += pi.used_blobs as u64;
-                stats.blobs[tpe].unused += pi.unused_blobs as u64;
-                stats.size[tpe].used += pi.used_size as u64;
-                stats.size[tpe].unused += pi.unused_size as u64;
+                stats.blobs[tpe].used += u64::from(pi.used_blobs);
+                stats.blobs[tpe].unused += u64::from(pi.unused_blobs);
+                stats.size[tpe].used += u64::from(pi.used_size);
+                stats.size[tpe].unused += u64::from(pi.unused_size);
                 stats.packs.keep += 1;
             }
             PackToDo::Repack => {
-                stats.blobs[tpe].used += pi.used_blobs as u64;
-                stats.blobs[tpe].unused += pi.unused_blobs as u64;
-                stats.size[tpe].used += pi.used_size as u64;
-                stats.size[tpe].unused += pi.unused_size as u64;
+                stats.blobs[tpe].used += u64::from(pi.used_blobs);
+                stats.blobs[tpe].unused += u64::from(pi.unused_blobs);
+                stats.size[tpe].used += u64::from(pi.used_size);
+                stats.size[tpe].unused += u64::from(pi.unused_size);
                 stats.packs.repack += 1;
-                stats.blobs[tpe].repack += (pi.unused_blobs + pi.used_blobs) as u64;
-                stats.blobs[tpe].repackrm += pi.unused_blobs as u64;
-                stats.size[tpe].repack += (pi.unused_size + pi.used_size) as u64;
-                stats.size[tpe].repackrm += pi.unused_size as u64;
+                stats.blobs[tpe].repack += u64::from(pi.unused_blobs + pi.used_blobs);
+                stats.blobs[tpe].repackrm += u64::from(pi.unused_blobs);
+                stats.size[tpe].repack += u64::from(pi.unused_size + pi.used_size);
+                stats.size[tpe].repackrm += u64::from(pi.unused_size);
             }
 
             PackToDo::MarkDelete => {
-                stats.blobs[tpe].unused += pi.unused_blobs as u64;
-                stats.size[tpe].unused += pi.unused_size as u64;
-                stats.blobs[tpe].remove += pi.unused_blobs as u64;
-                stats.size[tpe].remove += pi.unused_size as u64;
+                stats.blobs[tpe].unused += u64::from(pi.unused_blobs);
+                stats.size[tpe].unused += u64::from(pi.unused_size);
+                stats.blobs[tpe].remove += u64::from(pi.unused_blobs);
+                stats.size[tpe].remove += u64::from(pi.unused_size);
             }
             PackToDo::Recover => {
                 stats.packs_to_delete.recover += 1;
-                stats.size_to_delete.recover += self.size as u64;
+                stats.size_to_delete.recover += u64::from(self.size);
             }
             PackToDo::Delete => {
                 stats.packs_to_delete.remove += 1;
-                stats.size_to_delete.remove += self.size as u64;
+                stats.size_to_delete.remove += u64::from(self.size);
             }
             PackToDo::KeepMarked => {
                 stats.packs_to_delete.keep += 1;
-                stats.size_to_delete.keep += self.size as u64;
+                stats.size_to_delete.keep += u64::from(self.size);
             }
         }
         self.to_do = todo;
@@ -558,7 +520,7 @@ impl Pruner {
                             } else {
                                 // other partly used pack => candidate for repacking
                                 self.repack_candidates
-                                    .push((pi, PartlyUsed, index_num, pack_num))
+                                    .push((pi, PartlyUsed, index_num, pack_num));
                             }
                         }
                         (true, 0, _) => {
@@ -607,9 +569,9 @@ impl Pruner {
         };
 
         self.repack_candidates.sort_unstable_by_key(|rc| rc.0);
-        let mut resize_packs: BlobTypeMap<Vec<_>> = Default::default();
-        let mut do_repack: BlobTypeMap<bool> = Default::default();
-        let mut repack_size: BlobTypeMap<u64> = Default::default();
+        let mut resize_packs = BlobTypeMap::<Vec<_>>::default();
+        let mut do_repack = BlobTypeMap::default();
+        let mut repack_size = BlobTypeMap::<u64>::default();
 
         for (pi, repack_reason, index_num, pack_num) in std::mem::take(&mut self.repack_candidates)
         {
@@ -617,7 +579,7 @@ impl Pruner {
             let blob_type = pi.blob_type;
 
             let total_repack_size: u64 = repack_size.into_values().sum();
-            if total_repack_size + pi.used_size as u64 >= max_repack
+            if total_repack_size + u64::from(pi.used_size) >= max_repack
                 || (self.stats.size.sum().unused_after_prune() < max_unused
                     && repack_reason == PartlyUsed
                     && blob_type == BlobType::Data)
@@ -626,10 +588,10 @@ impl Pruner {
                 pack.set_todo(PackToDo::Keep, &pi, &mut self.stats);
             } else if repack_reason == SizeMismatch {
                 resize_packs[blob_type].push((pi, index_num, pack_num));
-                repack_size[blob_type] += pi.used_size as u64;
+                repack_size[blob_type] += u64::from(pi.used_size);
             } else {
                 pack.set_todo(PackToDo::Repack, &pi, &mut self.stats);
-                repack_size[blob_type] += pi.used_size as u64;
+                repack_size[blob_type] += u64::from(pi.used_size);
                 do_repack[blob_type] = true;
             }
         }
@@ -637,7 +599,7 @@ impl Pruner {
             // packs in resize_packs are only repacked if we anyway repack this blob type or
             // if the target pack size is reached for the blob type.
             let todo = if do_repack[blob_type]
-                || repack_size[blob_type] > pack_sizer[blob_type].pack_size() as u64
+                || repack_size[blob_type] > u64::from(pack_sizer[blob_type].pack_size())
             {
                 PackToDo::Repack
             } else {
@@ -690,7 +652,7 @@ impl Pruner {
 
         // all remaining packs in existing_packs are unreferenced packs
         for size in self.existing_packs.values() {
-            self.stats.size_unref += *size as u64;
+            self.stats.size_unref += u64::from(*size);
         }
 
         Ok(())
@@ -845,7 +807,7 @@ impl Pruner {
         let size_after_prune = BlobTypeMap::init(|blob_type| {
             self.stats.size[blob_type].total_after_prune()
                 + self.stats.blobs[blob_type].total_after_prune()
-                    * HeaderEntry::ENTRY_LEN_COMPRESSED as u64
+                    * u64::from(HeaderEntry::ENTRY_LEN_COMPRESSED)
         });
 
         let tree_repacker = Repacker::new(
@@ -946,7 +908,7 @@ impl Pruner {
                         } else {
                             repacker.add(&pack.id, blob)?;
                         }
-                        p.inc(blob.length as u64);
+                        p.inc(u64::from(blob.length));
                     }
                     if opts.instant_delete {
                         delete_pack(pack);
@@ -1034,8 +996,8 @@ impl Ord for PackInfo {
             // then order such that packs with highest
             // ratio unused/used space are picked first.
             // This is equivalent to ordering by unused / total space.
-            (other.unused_size as u64 * self.used_size as u64)
-                .cmp(&(self.unused_size as u64 * other.used_size as u64)),
+            (u64::from(other.unused_size) * u64::from(self.used_size))
+                .cmp(&(u64::from(self.unused_size) * u64::from(other.used_size))),
         )
     }
 }
@@ -1050,29 +1012,65 @@ impl PackInfo {
             unused_size: 0,
         };
 
-        // check if the pack has used blobs which are no duplicates
-        let needed_pack = pack
-            .blobs
-            .iter()
-            .any(|blob| used_ids.get(&blob.id) == Some(&1));
-
-        for blob in &pack.blobs {
-            let count = used_ids.get_mut(&blob.id);
-            match count {
+        // We search all blobs in the pack for needed ones. We do this by already marking
+        // and decreasing the used blob counter for the processed blobs. If the counter
+        // was decreased to 0, the blob and therefore the pack is actually used.
+        // Note that by this processing, we are also able to handle duplicate blobs within a pack
+        // correctly.
+        // If we found a needed blob, we stop and process the information that the pack is actually needed.
+        let first_needed = pack.blobs.iter().position(|blob| {
+            match used_ids.get_mut(&blob.id) {
                 None | Some(0) => {
                     pi.unused_size += blob.length;
                     pi.unused_blobs += 1;
                 }
-                Some(count) if needed_pack => {
-                    pi.used_size += blob.length;
-                    pi.used_blobs += 1;
-                    *count = 0;
-                }
                 Some(count) => {
-                    // mark as unused and decrease counter
-                    pi.unused_size += blob.length;
-                    pi.unused_blobs += 1;
+                    // decrease counter
                     *count -= 1;
+                    if *count == 0 {
+                        // blob is actually needed
+                        pi.used_size += blob.length;
+                        pi.used_blobs += 1;
+                        return true; // break the search
+                    } else {
+                        // blob is not needed
+                        pi.unused_size += blob.length;
+                        pi.unused_blobs += 1;
+                    }
+                }
+            }
+            false // continue with next blob
+        });
+
+        if let Some(first_needed) = first_needed {
+            // The pack is actually needed.
+            // We reprocess the blobs up to the first needed one and mark all blobs which are genarally needed as used.
+            for blob in &pack.blobs[..first_needed] {
+                match used_ids.get_mut(&blob.id) {
+                    None | Some(0) => {} // already correctly marked
+                    Some(count) => {
+                        // remark blob as used
+                        pi.unused_size -= blob.length;
+                        pi.unused_blobs -= 1;
+                        pi.used_size += blob.length;
+                        pi.used_blobs += 1;
+                        *count = 0; // count = 0 indicates to other packs that the blob is not needed anymore.
+                    }
+                }
+            }
+            // Then we process the remaining blobs and mark all blobs which are generally needed as used in this blob
+            for blob in &pack.blobs[first_needed + 1..] {
+                match used_ids.get_mut(&blob.id) {
+                    None | Some(0) => {
+                        pi.unused_size += blob.length;
+                        pi.unused_blobs += 1;
+                    }
+                    Some(count) => {
+                        // blob is used in this pack
+                        pi.used_size += blob.length;
+                        pi.used_blobs += 1;
+                        *count = 0; // count = 0 indicates to other packs that the blob is not needed anymore.
+                    }
                 }
             }
         }
