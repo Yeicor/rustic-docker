@@ -84,12 +84,12 @@ jobs:
           updated_refs="${updated_refs%,}]"
           echo "updatedrefs=$updated_refs" >> $GITHUB_OUTPUT
 
-    trigger-docker-for-updates:
-      runs-on: ubuntu-latest
-      needs: [ mirror ]
-      strategy:
-        matrix:
-          ref: ${{fromJSON(needs.mirror.outputs.updatedrefs)}}
-      uses: .github/workflows/docker-publish.yml@main
-      with:
-        ref: ${{ matrix.ref }}
+  trigger-docker-for-updates:
+    runs-on: ubuntu-latest
+    needs: [ mirror ]
+    strategy:
+      matrix:
+        ref: ${{fromJSON(needs.mirror.outputs.updatedrefs)}}
+    uses: .github/workflows/docker-publish.yml@main
+    with:
+      ref: ${{ matrix.ref }}
