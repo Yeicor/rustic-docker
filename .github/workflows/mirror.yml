@@ -46,7 +46,7 @@ jobs:
               git checkout main
               find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.git/*" -or -path "${GITHUB_WORKSPACE}/.github/*" \) -delete
             else # Also delete workflows otherwise
-              git checkout "$bt" || ( git checkout main && git branch "$bt" )
+              git checkout "autobranchfortag_$bt" || ( git checkout main && git branch "autobranchfortag_$bt" )
               find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.git/*" \) -delete
             fi
             find ${GITHUB_WORKSPACE}/ -type d -empty -delete
@@ -65,6 +65,11 @@ jobs:
             git add -v .
             if [[ `git status --porcelain` ]]; then # Changes
               git commit -am "Automated sync of original sources"
+              if git tag | grep "$bt" >/dev/null; then
+                git tag "$bt"
+              else
+                git branch -m "autobranchfortag_$bt" "$bt"
+              fi
               git push origin $bt
               echo "Changes pushed..."
             else
