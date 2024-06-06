@@ -1,0 +1,56 @@
+on:
+  # schedule:
+  #   - cron: '0 * * * *'
+  push:
+    branches:
+      - 'main'
+    paths:
+      - '.github/**'
+  pull_request:
+    branches:
+      - 'main'
+    paths:
+      - '.github/**'
+  workflow_dispatch: {}
+
+
+jobs:
+
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.push.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4  # Checkout original repository
+        with:
+          repository: 'rustic-rs/rustic'
+          fetch-depth: 0
+      - run: |
+          find $(dirname ${GITHUB_WORKSPACE})
+          mv ${GITHUB_WORKSPACE} ${GITHUB_WORKSPACE}_original
+          mkdir ${GITHUB_WORKSPACE}
+          echo "==========="
+          find $(dirname ${GITHUB_WORKSPACE})
+      - uses: actions/checkout@v4   # Checkout self (to keep our custom files)
+        with:
+          fetch-depth: 0
+      - id: push
+        run: |  
+          # Delete all non-custom files from our repository (in case of deletions in the original repository)
+          find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.git/*" -or -path "${GITHUB_WORKSPACE}/.github/*" \) -delete
+          find ${GITHUB_WORKSPACE}/ -type d -empty -delete
+          find ${GITHUB_WORKSPACE}/
+          # Copy all files from the original repository
+          rsync -a --exclude='.git' --exclude='.github' ${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
+          # - Removing original workflows
+          git config --global user.name 'yeicor-mirror.yml'
+          git config --global user.email 'Yeicor@users.noreply.github.com'
+          git add -v .
+          if [[ `git status --porcelain` ]]; then # Changes
+            git commit -am "Automated sync of original sources"
+            git push
+          else
+            echo "No changes detected..."
+          fi
