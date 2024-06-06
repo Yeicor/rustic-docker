@@ -19,11 +19,11 @@ jobs:
     steps:
       - id: early
         run: |
-        if [ -f Dockerfile ]; then
-          echo "status=success" >> $GITHUB_OUTPUT
-        else
-          echo "status=failure" >> $GITHUB_OUTPUT
-        fi
+          if [ -f Dockerfile ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
 
   docker:
     needs: check
