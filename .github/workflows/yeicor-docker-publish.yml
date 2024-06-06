@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      changed: ${{ steps.push.outputs.changed }}
     steps:
       - uses: actions/checkout@v4  # Checkout original repository
         with:
@@ -32,7 +34,8 @@ jobs:
       - uses: actions/checkout@v4   # Checkout self (to keep our custom files)
         with:
           fetch-depth: 0
-      - run: |  
+      - id: push
+        run: |  
           # Delete all non-custom files from our repository (in case of deletions in the original repository)
           find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.git/*" -or -path "${GITHUB_WORKSPACE}/.github/workflows/yeicor-*" -or -path "${GITHUB_WORKSPACE}/renovate.json" \) -delete
           find ${GITHUB_WORKSPACE}/ -type d -empty -delete
@@ -47,8 +50,10 @@ jobs:
           if [[ `git status --porcelain` ]]; then # Changes
             git commit -am "Automated sync of original sources"
             git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "No changes detected..."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
           
 
@@ -94,6 +99,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-args: RUST_VERSION=slim-bookworm
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
