@@ -13,7 +13,21 @@ on:
 
 jobs:
 
+  check:
+    outputs:
+      status: ${{ steps.early.status }}
+    steps:
+      - id: early
+        run: |
+        if [ -f Dockerfile ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "status=failure" >> $GITHUB_OUTPUT
+        fi
+
   docker:
+    needs: check
+    if: needs.check.outputs.status == 'success'
 
     runs-on: ubuntu-latest
     permissions:
