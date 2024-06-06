@@ -17,24 +17,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4  # Checkout self (to keep our custom files)
-        with:
-          fetch-depth: 0
-      - run: |
-          find $(dirname ${GITHUB_WORKSPACE})
-          mv ${GITHUB_WORKSPACE} ${GITHUB_WORKSPACE}_old
-          find $(dirname ${GITHUB_WORKSPACE})
-          find ${GITHUB_WORKSPACE}_old/ -type f -not \( -path "${GITHUB_WORKSPACE}_old/.github/workflows/yeicor-" -or -path "${GITHUB_WORKSPACE}_old/renovate.json" \) -delete
-          find ${GITHUB_WORKSPACE}_old/ -type d -empty -delete
-          find ${GITHUB_WORKSPACE}_old/
-          mkdir ${GITHUB_WORKSPACE}
       - uses: actions/checkout@v4  # Checkout original repository
         with:
           repository: 'rustic-rs/rustic'
           fetch-depth: 0
-      - run: |  # Overwrite the original repository with our files
-          find ${GITHUB_WORKSPACE}_old/
-          mv ${GITHUB_WORKSPACE}_old/* ${GITHUB_WORKSPACE}/
-          git remote add mirror "git@github.com:${{ github.repository }}.git"
-          git push --tags --force --prune mirror "refs/remotes/origin/*:refs/heads/*"
+      - run: |
+          find $(dirname ${GITHUB_WORKSPACE})
+          mv ${GITHUB_WORKSPACE} ${GITHUB_WORKSPACE}_original
+          mkdir ${GITHUB_WORKSPACE}
+          echo "==========="
+          find $(dirname ${GITHUB_WORKSPACE})
+      - uses: actions/checkout@v4   # Checkout self (to keep our custom files)
+        with:
+          fetch-depth: 0
+      - run: |  # Copy all files from the original repository
+          rsync -a --exclude='.git'${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
+          git config --global user.name 'yeicor-mirror.yml'
+          git config --global user.email 'Yeicor@users.noreply.github.com'
+          git commit -am "Automated sync of original sources"
+          git push
+          
+      
           
