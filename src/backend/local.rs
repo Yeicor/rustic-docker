@@ -57,7 +57,7 @@ impl LocalBackend {
     fn call_command(&self, tpe: FileType, id: &Id, filename: &Path, command: &str) -> Result<()> {
         let id = id.to_hex();
         let patterns = &["%file", "%type", "%id"];
-        let ac = AhoCorasick::new(patterns);
+        let ac = AhoCorasick::new(patterns)?;
         let replace_with = &[filename.to_str().unwrap(), tpe.name(), id.as_str()];
         let actual_command = ac.replace_all(command, replace_with);
         debug!("calling {actual_command}...");
@@ -327,8 +327,8 @@ impl LocalDestination {
 
         let filename = self.path(item);
 
-        if let Some(mode) = node.meta.mode() {
-            let mode = map_mode_from_go(*mode);
+        if let Some(mode) = node.meta.mode {
+            let mode = map_mode_from_go(mode);
             std::fs::set_permissions(filename, fs::Permissions::from_mode(mode))?;
         }
         Ok(())
@@ -410,7 +410,7 @@ impl LocalDestination {
     pub fn create_special(&self, item: impl AsRef<Path>, node: &Node) -> Result<()> {
         let filename = self.path(item);
 
-        match node.node_type() {
+        match &node.node_type {
             NodeType::Symlink { linktarget } => {
                 symlink(linktarget, filename)?;
             }

@@ -6,16 +6,15 @@ use comfy_table::Cell;
 use humantime::format_duration;
 use itertools::Itertools;
 
-use super::{bold_cell, bytes, table, table_right_from, RusticConfig};
-use crate::repofile::{
-    DeleteOption, SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion,
-};
+use super::{bold_cell, bytes, table, table_right_from, Config};
+use crate::repofile::{DeleteOption, SnapshotFile, SnapshotGroup, SnapshotGroupCriterion};
 use crate::repository::OpenRepository;
 
 #[derive(Parser)]
 pub(super) struct Opts {
-    #[clap(flatten, help_heading = "SNAPSHOT FILTER OPTIONS")]
-    filter: SnapshotFilter,
+    /// Snapshots to show. If none is given, use filter options to filter from all snapshots
+    #[clap(value_name = "ID")]
+    ids: Vec<String>,
 
     /// Group snapshots by any combination of host,label,paths,tags
     #[clap(
@@ -37,23 +36,13 @@ pub(super) struct Opts {
     /// Show all snapshots instead of summarizing identical follow-up snapshots
     #[clap(long, conflicts_with_all = &["long", "json"])]
     all: bool,
-
-    /// Snapshots to show
-    #[clap(value_name = "ID")]
-    ids: Vec<String>,
 }
 
-pub(super) fn execute(
-    repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
-    config_file.merge_into("snapshot-filter", &mut opts.filter)?;
-
+pub(super) fn execute(repo: OpenRepository, config: Config, opts: Opts) -> Result<()> {
     let groups = match &opts.ids[..] {
-        [] => SnapshotFile::group_from_backend(&repo.dbe, &opts.filter, &opts.group_by)?,
+        [] => SnapshotFile::group_from_backend(&repo.dbe, &config.snapshot_filter, &opts.group_by)?,
         [id] if id == "latest" => {
-            SnapshotFile::group_from_backend(&repo.dbe, &opts.filter, &opts.group_by)?
+            SnapshotFile::group_from_backend(&repo.dbe, &config.snapshot_filter, &opts.group_by)?
                 .into_iter()
                 .map(|(group, mut snaps)| {
                     snaps.sort_unstable();

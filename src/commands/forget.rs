@@ -2,13 +2,13 @@ use std::str::FromStr;
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
-use clap::{AppSettings, Parser};
+use clap::Parser;
 use derivative::Derivative;
 use merge::Merge;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 
-use super::{progress_counter, prune, table_with_titles, RusticConfig};
+use super::{progress_counter, prune, table_with_titles, Config};
 use crate::backend::{DecryptWriteBackend, FileType};
 use crate::repofile::{
     SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion, StringList,
@@ -16,57 +16,51 @@ use crate::repofile::{
 use crate::repository::OpenRepository;
 
 #[derive(Parser)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 pub(super) struct Opts {
+    /// Snapshots to forget. If none is given, use filter options to filter from all snapshots
+    #[clap(value_name = "ID")]
+    ids: Vec<String>,
+
     #[clap(flatten)]
     config: ConfigOpts,
 
-    /// Also prune the repository
-    #[clap(long)]
-    prune: bool,
-
-    #[clap(flatten, help_heading = "PRUNE OPTIONS (only when used with --prune)")]
+    #[clap(
+        flatten,
+        next_help_heading = "PRUNE OPTIONS (only when used with --prune)"
+    )]
     prune_opts: prune::Opts,
-
-    /// Don't remove anything, only show what would be done
-    #[clap(skip)]
-    dry_run: bool,
-
-    /// Snapshots to forget
-    ids: Vec<String>,
 }
 
 #[serde_as]
-#[derive(Default, Parser, Deserialize, Merge)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-struct ConfigOpts {
+#[derive(Clone, Default, Parser, Deserialize, Merge)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ConfigOpts {
     /// Group snapshots by any combination of host,label,paths,tags (default: "host,label,paths")
     #[clap(long, short = 'g', value_name = "CRITERION")]
     #[serde_as(as = "Option<DisplayFromStr>")]
     group_by: Option<SnapshotGroupCriterion>,
 
-    #[clap(flatten, help_heading = "SNAPSHOT FILTER OPTIONS")]
+    /// Also prune the repository
+    #[clap(long)]
+    #[merge(strategy = merge::bool::overwrite_false)]
+    prune: bool,
+
+    #[clap(flatten, next_help_heading = "Snapshot filter options")]
     #[serde(flatten)]
     filter: SnapshotFilter,
 
-    #[clap(flatten, help_heading = "RETENTION OPTIONS")]
+    #[clap(flatten, next_help_heading = "Retention options")]
     #[serde(flatten)]
     keep: KeepOptions,
 }
 
-pub(super) fn execute(
-    repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
+pub(super) fn execute(repo: OpenRepository, config: Config, mut opts: Opts) -> Result<()> {
     let be = &repo.dbe;
     // merge "forget" section from config file, if given
-    config_file.merge_into("forget", &mut opts.config)?;
+    opts.config.merge(config.forget.clone());
     // merge "snapshot-filter" section from config file, if given
-    config_file.merge_into("snapshot-filter", &mut opts.config.filter)?;
+    opts.config.filter.merge(config.snapshot_filter.clone());
 
-    opts.dry_run = opts.prune_opts.dry_run;
     let group_by = opts
         .config
         .group_by
@@ -144,7 +138,7 @@ pub(super) fn execute(
         println!();
     }
 
-    match (forget_snaps.is_empty(), opts.dry_run) {
+    match (forget_snaps.is_empty(), config.global.dry_run) {
         (true, _) => println!("nothing to remove"),
         (false, true) => println!("would have removed the following snapshots:\n {forget_snaps:?}"),
         (false, false) => {
@@ -153,8 +147,8 @@ pub(super) fn execute(
         }
     }
 
-    if opts.prune {
-        prune::execute(repo, opts.prune_opts, forget_snaps)?;
+    if opts.config.prune {
+        prune::execute(repo, config, opts.prune_opts, forget_snaps)?;
     }
 
     Ok(())
@@ -176,45 +170,45 @@ pub(super) struct KeepOptions {
     #[merge(strategy=merge::vec::overwrite_empty)]
     keep_ids: Vec<String>,
 
-    /// Keep the last N snapshots
-    #[clap(long, short = 'l', value_name = "N", default_value = "0")]
+    /// Keep the last N snapshots (N == -1: keep all snapshots)
+    #[clap(long, short = 'l', value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_last: u32,
+    keep_last: i32,
 
-    /// Keep the last N hourly snapshots
-    #[clap(long, short = 'H', value_name = "N", default_value = "0")]
+    /// Keep the last N hourly snapshots (N == -1: keep all hourly snapshots)
+    #[clap(long, short = 'H', value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_hourly: u32,
+    keep_hourly: i32,
 
-    /// Keep the last N daily snapshots
-    #[clap(long, short = 'd', value_name = "N", default_value = "0")]
+    /// Keep the last N daily snapshots (N == -1: keep all daily snapshots)
+    #[clap(long, short = 'd', value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_daily: u32,
+    keep_daily: i32,
 
-    /// Keep the last N weekly snapshots
-    #[clap(long, short = 'w', value_name = "N", default_value = "0")]
+    /// Keep the last N weekly snapshots (N == -1: keep all weekly snapshots)
+    #[clap(long, short = 'w', value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_weekly: u32,
+    keep_weekly: i32,
 
-    /// Keep the last N monthly snapshots
-    #[clap(long, short = 'm', value_name = "N", default_value = "0")]
+    /// Keep the last N monthly snapshots (N == -1: keep all monthly snapshots)
+    #[clap(long, short = 'm', value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_monthly: u32,
+    keep_monthly: i32,
 
-    /// Keep the last N quarter-yearly snapshots
-    #[clap(long, value_name = "N", default_value = "0")]
+    /// Keep the last N quarter-yearly snapshots (N == -1: keep all quarter-yearly snapshots)
+    #[clap(long, value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_quarter_yearly: u32,
+    keep_quarter_yearly: i32,
 
-    /// Keep the last N half-yearly snapshots
-    #[clap(long, value_name = "N", default_value = "0")]
+    /// Keep the last N half-yearly snapshots (N == -1: keep all half-yearly snapshots)
+    #[clap(long, value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_half_yearly: u32,
+    keep_half_yearly: i32,
 
-    /// Keep the last N yearly snapshots
-    #[clap(long, short = 'y', value_name = "N", default_value = "0")]
+    /// Keep the last N yearly snapshots (N == -1: keep all yearly snapshots)
+    #[clap(long, short = 'y', value_name = "N", default_value = "0", allow_hyphen_values = true, value_parser = clap::value_parser!(i32).range(-1..))]
     #[merge(strategy=merge::num::overwrite_zero)]
-    keep_yearly: u32,
+    keep_yearly: i32,
 
     /// Keep snapshots newer than DURATION relative to latest snapshot
     #[clap(long, value_name = "DURATION", default_value = "0h")]
@@ -405,10 +399,12 @@ impl KeepOptions {
 
         for (check_fun, counter, reason1, within, reason2) in keep_checks {
             if !has_next || last.is_none() || !check_fun(sn, last.unwrap()) {
-                if *counter > 0 {
-                    *counter -= 1;
+                if *counter != 0 {
                     keep = true;
                     reason.push(reason1);
+                    if *counter > 0 {
+                        *counter -= 1;
+                    }
                 }
                 if sn.time + Duration::from_std(*within).unwrap() > latest_time {
                     keep = true;

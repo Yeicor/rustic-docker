@@ -3,16 +3,17 @@ use clap::Parser;
 use std::path::Path;
 
 use super::progress_counter;
-use super::rustic_config::RusticConfig;
+use super::Config;
 use crate::blob::{NodeStreamer, Tree, TreeStreamerOptions};
 use crate::index::IndexBackend;
-use crate::repofile::{SnapshotFile, SnapshotFilter};
+use crate::repofile::SnapshotFile;
 use crate::repository::OpenRepository;
 
 #[derive(Parser)]
 pub(super) struct Opts {
-    #[clap(flatten, help_heading = "SNAPSHOT FILTER OPTIONS (when using latest)")]
-    filter: SnapshotFilter,
+    /// Snapshot/path to list
+    #[clap(value_name = "SNAPSHOT[:PATH]")]
+    snap: String,
 
     /// recursively list the dir (default when no PATH is given)
     #[clap(long)]
@@ -20,18 +21,9 @@ pub(super) struct Opts {
 
     #[clap(flatten)]
     streamer_opts: TreeStreamerOptions,
-
-    /// Snapshot/path to list
-    #[clap(value_name = "SNAPSHOT[:PATH]")]
-    snap: String,
 }
 
-pub(super) fn execute(
-    repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
-    config_file.merge_into("snapshot-filter", &mut opts.filter)?;
+pub(super) fn execute(repo: OpenRepository, config: Config, opts: Opts) -> Result<()> {
     let be = &repo.dbe;
     let mut recursive = opts.recursive;
 
@@ -39,7 +31,12 @@ pub(super) fn execute(
         recursive = true;
         (&opts.snap, "")
     });
-    let snap = SnapshotFile::from_str(be, id, |sn| sn.matches(&opts.filter), progress_counter(""))?;
+    let snap = SnapshotFile::from_str(
+        be,
+        id,
+        |sn| sn.matches(&config.snapshot_filter),
+        progress_counter(""),
+    )?;
     let index = IndexBackend::new(be, progress_counter(""))?;
     let node = Tree::node_from_path(&index, snap.tree, Path::new(path))?;
 

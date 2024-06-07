@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 
 use anyhow::{bail, Result};
-use clap::{AppSettings, Parser};
+use clap::Parser;
 use log::*;
+use merge::Merge;
 use rayon::prelude::*;
+use serde::Deserialize;
 
-use super::{progress_counter, table_with_titles, RusticConfig};
+use super::{progress_counter, table_with_titles, Config};
 use crate::backend::DecryptWriteBackend;
 use crate::blob::{BlobType, NodeType, Packer, TreeStreamerOnce};
 use crate::index::{IndexBackend, IndexedBackend, Indexer, ReadIndex};
@@ -13,39 +15,26 @@ use crate::repofile::{Id, SnapshotFile, SnapshotFilter};
 use crate::repository::{OpenRepository, Repository, RepositoryOptions};
 
 #[derive(Parser)]
-#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 pub(super) struct Opts {
-    /// Don't copy any snapshot, only show what would be done
-    #[clap(long, short = 'n')]
-    dry_run: bool,
-
-    #[clap(
-        flatten,
-        help_heading = "SNAPSHOT FILTER OPTIONS (if no snapshot is given)"
-    )]
-    filter: SnapshotFilter,
-
-    /// Snapshots to copy. If none is given, use filter to filter from all
-    /// snapshots.
+    /// Snapshots to copy. If none is given, use filter options to filter from all snapshots.
     #[clap(value_name = "ID")]
     ids: Vec<String>,
 }
 
-pub(super) fn execute(
-    repo: OpenRepository,
-    mut opts: Opts,
-    config_file: RusticConfig,
-) -> Result<()> {
-    config_file.merge_into("snapshot-filter", &mut opts.filter)?;
+#[derive(Default, Deserialize, Merge)]
+pub struct Targets {
+    #[merge(strategy = merge::vec::overwrite_empty)]
+    targets: Vec<RepositoryOptions>,
+}
 
-    let target_opts: Vec<RepositoryOptions> = config_file.get("copy.targets")?;
-    if target_opts.is_empty() {
+pub(super) fn execute(repo: OpenRepository, config: Config, opts: Opts) -> Result<()> {
+    if config.copy.targets.is_empty() {
         bail!("no [[copy.targets]] section in config file found!");
     }
 
     let be = &repo.dbe;
     let mut snapshots = match opts.ids.is_empty() {
-        true => SnapshotFile::all_from_backend(be, &opts.filter)?,
+        true => SnapshotFile::all_from_backend(be, &config.snapshot_filter)?,
         false => SnapshotFile::from_ids(be, &opts.ids)?,
     };
     // sort for nicer output
@@ -56,13 +45,13 @@ pub(super) fn execute(
 
     let poly = repo.config.poly()?;
 
-    for target_opt in target_opts {
-        let repo_dest = Repository::new(target_opt)?.open()?;
+    for target_opt in &config.copy.targets {
+        let repo_dest = Repository::new(target_opt.clone())?.open()?;
         info!("copying to target {}...", repo_dest.name);
         if poly != repo_dest.config.poly()? {
             bail!("cannot copy to repository with different chunker parameter (re-chunking not implemented)!");
         }
-        copy(&snapshots, index.clone(), repo_dest, &opts)?;
+        copy(&snapshots, index.clone(), repo_dest, &config)?;
     }
     Ok(())
 }
@@ -71,12 +60,12 @@ fn copy(
     snapshots: &[SnapshotFile],
     index: impl IndexedBackend,
     repo_dest: OpenRepository,
-    opts: &Opts,
+    config: &Config,
 ) -> Result<()> {
     let be_dest = &repo_dest.dbe;
 
-    let snapshots = relevant_snapshots(snapshots, &repo_dest, &opts.filter)?;
-    match (snapshots.len(), opts.dry_run) {
+    let snapshots = relevant_snapshots(snapshots, &repo_dest, &config.snapshot_filter)?;
+    match (snapshots.len(), config.global.dry_run) {
         (count, true) => {
             info!("would have copied {count} snapshots");
             return Ok(());
@@ -114,7 +103,7 @@ fn copy(
         trace!("copy tree blob {id}");
         if !index_dest.has_tree(id) {
             let data = index.get_tree(id).unwrap().read_data(index.be())?;
-            tree_packer.add(&data, id)?;
+            tree_packer.add(data, *id)?;
         }
         Ok(())
     })?;
@@ -124,8 +113,8 @@ fn copy(
         .par_bridge()
         .try_for_each(|item| -> Result<_> {
             let (_, tree) = item?;
-            tree.nodes().par_iter().try_for_each(|node| {
-                match node.node_type() {
+            tree.nodes.par_iter().try_for_each(|node| {
+                match node.node_type {
                     NodeType::File => {
                         node.content
                             .par_iter()
@@ -134,18 +123,18 @@ fn copy(
                                 trace!("copy data blob {id}");
                                 if !index_dest.has_data(id) {
                                     let data = index.get_data(id).unwrap().read_data(index.be())?;
-                                    data_packer.add(&data, id)?;
+                                    data_packer.add(data, *id)?;
                                 }
                                 Ok(())
                             })?;
                     }
 
                     NodeType::Dir => {
-                        let id = node.subtree().unwrap();
+                        let id = node.subtree.unwrap();
                         trace!("copy tree blob {id}");
                         if !index_dest.has_tree(&id) {
                             let data = index.get_tree(&id).unwrap().read_data(index.be())?;
-                            tree_packer.add(&data, &id)?;
+                            tree_packer.add(data, id)?;
                         }
                     }
 
