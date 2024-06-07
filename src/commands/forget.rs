@@ -30,6 +30,10 @@ pub(super) struct ForgetCmd {
     #[clap(long)]
     json: bool,
 
+    /// Don't show any output
+    #[clap(long, conflicts_with = "json")]
+    quiet: bool,
+
     /// Forget options
     #[clap(flatten)]
     config: ForgetOptions,
@@ -95,7 +99,7 @@ impl Runnable for ForgetCmd {
 impl ForgetCmd {
     fn inner_run(&self) -> Result<()> {
         let config = RUSTIC_APP.config();
-        let repo = open_repository(&config)?;
+        let repo = open_repository(&config.repository)?;
 
         let group_by = config.forget.group_by.unwrap_or_default();
 
@@ -122,7 +126,7 @@ impl ForgetCmd {
         if self.json {
             let mut stdout = std::io::stdout();
             serde_json::to_writer_pretty(&mut stdout, &groups)?;
-        } else {
+        } else if !self.quiet {
             print_groups(&groups);
         }
 

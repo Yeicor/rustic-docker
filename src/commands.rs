@@ -22,10 +22,15 @@ pub(crate) mod self_update;
 pub(crate) mod show_config;
 pub(crate) mod snapshots;
 pub(crate) mod tag;
+#[cfg(feature = "webdav")]
+pub(crate) mod webdav;
 
+use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::str::FromStr;
 
+#[cfg(feature = "webdav")]
+use crate::commands::webdav::WebDavCmd;
 use crate::{
     commands::{
         backup::BackupCmd, cat::CatCmd, check::CheckCmd, completions::CompletionsCmd,
@@ -34,14 +39,23 @@ use crate::{
         repair::RepairCmd, repoinfo::RepoInfoCmd, restore::RestoreCmd, self_update::SelfUpdateCmd,
         show_config::ShowConfigCmd, snapshots::SnapshotCmd, tag::TagCmd,
     },
-    config::{progress_options::ProgressOptions, RusticConfig},
+    config::{progress_options::ProgressOptions, AllRepositoryOptions, RusticConfig},
     {Application, RUSTIC_APP},
 };
 
-use abscissa_core::{config::Override, Command, Configurable, FrameworkError, Runnable, Shutdown};
+use abscissa_core::{
+    config::Override, terminal::ColorChoice, Command, Configurable, FrameworkError,
+    FrameworkErrorKind, Runnable, Shutdown,
+};
 use anyhow::{anyhow, Result};
+use clap::builder::{
+    styling::{AnsiColor, Effects},
+    Styles,
+};
 use dialoguer::Password;
+use log::{log, Level};
 use rustic_core::{OpenStatus, Repository};
+use simplelog::{CombinedLogger, LevelFilter, TermLogger, TerminalMode, WriteLogger};
 
 pub(super) mod constants {
     pub(super) const MAX_PASSWORD_RETRIES: usize = 5;
@@ -101,6 +115,7 @@ enum RusticCmd {
     ShowConfig(ShowConfigCmd),
 
     /// Update to the latest rustic release
+    #[cfg_attr(not(feature = "self-update"), clap(hide = true))]
     SelfUpdate(SelfUpdateCmd),
 
     /// Remove unused data or repack repository pack files
@@ -117,11 +132,23 @@ enum RusticCmd {
 
     /// Change tags of snapshots
     Tag(TagCmd),
+
+    /// Start a webdav server which allows to access the repository
+    #[cfg(feature = "webdav")]
+    Webdav(WebDavCmd),
+}
+
+fn styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::Red.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Red.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Blue.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Green.on_default())
 }
 
 /// Entry point for the application. It needs to be a struct to allow using subcommands!
 #[derive(clap::Parser, Command, Debug)]
-#[command(author, about, name="rustic", version = option_env!("PROJECT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
+#[command(author, about, name="rustic", styles=styles(), version = option_env!("PROJECT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
 pub struct EntryPoint {
     #[command(flatten)]
     pub config: RusticConfig,
@@ -153,17 +180,63 @@ impl Configurable<RusticConfig> for EntryPoint {
         // rustic logic and merged with the CLI options.
         // That's why it says `_config`, because it's not read at all and therefore not needed.
         let mut config = self.config.clone();
-        if config.global.use_profile.is_empty() {
-            config.global.use_profile.push("rustic".to_string());
-        }
+
+        // collect logs during merging as we start the logger *after* merging
+        let mut merge_logs = Vec::new();
 
         // get global options from command line / env and config file
-        for profile in &config.global.use_profile.clone() {
-            config.merge_profile(profile)?;
+        if config.global.use_profile.is_empty() {
+            config.merge_profile("rustic", &mut merge_logs, Level::Info)?;
+        } else {
+            for profile in &config.global.use_profile.clone() {
+                config.merge_profile(profile, &mut merge_logs, Level::Warn)?;
+            }
+        }
+
+        // start logger
+        let level_filter = match &config.global.log_level {
+            Some(level) => LevelFilter::from_str(level)
+                .map_err(|e| FrameworkErrorKind::ConfigError.context(e))?,
+            None => LevelFilter::Info,
+        };
+        match &config.global.log_file {
+            None => TermLogger::init(
+                level_filter,
+                simplelog::ConfigBuilder::new()
+                    .set_time_level(LevelFilter::Off)
+                    .build(),
+                TerminalMode::Stderr,
+                ColorChoice::Auto,
+            )
+            .map_err(|e| FrameworkErrorKind::ConfigError.context(e))?,
+
+            Some(file) => CombinedLogger::init(vec![
+                TermLogger::new(
+                    level_filter.min(LevelFilter::Warn),
+                    simplelog::ConfigBuilder::new()
+                        .set_time_level(LevelFilter::Off)
+                        .build(),
+                    TerminalMode::Stderr,
+                    ColorChoice::Auto,
+                ),
+                WriteLogger::new(
+                    level_filter,
+                    simplelog::Config::default(),
+                    File::options().create(true).append(true).open(file)?,
+                ),
+            ])
+            .map_err(|e| FrameworkErrorKind::ConfigError.context(e))?,
+        }
+
+        // display logs from merging
+        for (level, merge_log) in merge_logs {
+            log!(level, "{}", merge_log);
         }
 
         match &self.commands {
             RusticCmd::Forget(cmd) => cmd.override_config(config),
+            #[cfg(feature = "webdav")]
+            RusticCmd::Webdav(cmd) => cmd.override_config(config),
 
             // subcommands that don't need special overrides use a catch all
             _ => Ok(config),
@@ -171,11 +244,24 @@ impl Configurable<RusticConfig> for EntryPoint {
     }
 }
 
-/// Open the repository with the given config
+/// Get the repository with the given options
 ///
 /// # Arguments
 ///
-/// * `config` - The config file
+/// * `repo_opts` - The repository options
+///
+fn get_repository(repo_opts: &AllRepositoryOptions) -> Result<Repository<ProgressOptions, ()>> {
+    let po = RUSTIC_APP.config().global.progress_options;
+    let backends = repo_opts.be.to_backends()?;
+    let repo = Repository::new_with_progress(&repo_opts.repo, backends, po)?;
+    Ok(repo)
+}
+
+/// Open the repository with the given options
+///
+/// # Arguments
+///
+/// * `repo_opts` - The repository options
 ///
 /// # Errors
 ///
@@ -190,9 +276,10 @@ impl Configurable<RusticConfig> for EntryPoint {
 /// [`RepositoryErrorKind::PasswordCommandParsingFailed`]: crate::error::RepositoryErrorKind::PasswordCommandParsingFailed
 /// [`RepositoryErrorKind::ReadingPasswordFromCommandFailed`]: crate::error::RepositoryErrorKind::ReadingPasswordFromCommandFailed
 /// [`RepositoryErrorKind::FromSplitError`]: crate::error::RepositoryErrorKind::FromSplitError
-fn open_repository(config: &Arc<RusticConfig>) -> Result<Repository<ProgressOptions, OpenStatus>> {
-    let po = config.global.progress_options;
-    let repo = Repository::new_with_progress(&config.repository, po)?;
+fn open_repository(
+    repo_opts: &AllRepositoryOptions,
+) -> Result<Repository<ProgressOptions, OpenStatus>> {
+    let repo = get_repository(repo_opts)?;
     match repo.password()? {
         // if password is given, directly return the result of find_key_in_backend and don't retry
         Some(pass) => {
@@ -206,8 +293,8 @@ fn open_repository(config: &Arc<RusticConfig>) -> Result<Repository<ProgressOpti
                     .interact()?;
                 match repo.clone().open_with_password(&pass) {
                     Ok(repo) => return Ok(repo),
-                    // TODO: fail if error != Password incorrect
-                    Err(_) => continue,
+                    Err(err) if err.is_incorrect_password() => continue,
+                    Err(err) => return Err(err.into()),
                 }
             }
         }

@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use rustic_core::{
     repofile::{BlobType, Node, NodeType},
     IndexedFull, LocalDestination, LocalSource, LocalSourceFilterOptions, LocalSourceSaveOptions,
-    LsOptions, ReadSourceEntry, Repository, RusticResult,
+    LsOptions, ReadSource, ReadSourceEntry, Repository, RusticResult,
 };
 
 /// `diff` subcommand
@@ -50,13 +50,12 @@ impl Runnable for DiffCmd {
 impl DiffCmd {
     fn inner_run(&self) -> Result<()> {
         let config = RUSTIC_APP.config();
-
-        let repo = open_repository(&config)?.to_indexed()?;
+        let repo = open_repository(&config.repository)?.to_indexed()?;
 
         let (id1, path1) = arg_to_snap_path(&self.snap1, "");
         let (id2, path2) = arg_to_snap_path(&self.snap2, path1);
 
-        _ = match (id1, id2) {
+        match (id1, id2) {
             (Some(id1), Some(id2)) => {
                 // diff between two snapshots
                 let snaps = repo.get_snapshots(&[id1, id2])?;
@@ -73,7 +72,7 @@ impl DiffCmd {
                     self.no_content,
                     |_path, node1, node2| Ok(node1.content == node2.content),
                     self.metadata,
-                )
+                )?;
             }
             (Some(id1), None) => {
                 // diff between snapshot and local path
@@ -92,6 +91,7 @@ impl DiffCmd {
                     &self.ignore_opts,
                     &[&path2],
                 )?
+                .entries()
                 .map(|item| -> RusticResult<_> {
                     let ReadSourceEntry { path, node, .. } = item?;
                     let path = if is_dir {
@@ -110,7 +110,7 @@ impl DiffCmd {
                     self.no_content,
                     |path, node1, _node2| identical_content_local(&local, &repo, path, node1),
                     self.metadata,
-                )
+                )?;
             }
             (None, _) => {
                 bail!("cannot use local path as first argument");
@@ -133,6 +133,7 @@ impl DiffCmd {
 /// A tuple of the snapshot id and the path
 fn arg_to_snap_path<'a>(arg: &'a str, default_path: &'a str) -> (Option<&'a str>, &'a str) {
     match arg.split_once(':') {
+        Some(("local", path)) => (None, path),
         Some((id, path)) => (Some(id), path),
         None => {
             if arg.contains('/') {
