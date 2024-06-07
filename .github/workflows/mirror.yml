@@ -1,6 +1,6 @@
 on:
-  # schedule:
-  #   - cron: '0 * * * *'
+  schedule:
+    - cron: '0 * * * *'
   push:
     branches:
       - 'main'
@@ -86,7 +86,7 @@ jobs:
               echo "No changes detected..."
             fi
           done
-          updated_refs="${updated_refs%,},\"main\"]"
+          updated_refs="${updated_refs%,}]"
           echo "updatedrefs=$updated_refs" >> $GITHUB_OUTPUT
 
   trigger-docker-for-updates:
