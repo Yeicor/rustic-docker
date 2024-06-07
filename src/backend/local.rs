@@ -2,8 +2,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::Result;
+use aho_corasick::AhoCorasick;
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use filetime::{set_file_atime, set_file_mtime, FileTime};
 use log::*;
@@ -12,19 +14,27 @@ use nix::unistd::chown;
 use nix::unistd::{Gid, Group, Uid, User};
 use walkdir::WalkDir;
 
+use crate::repository::parse_command;
+
 use super::node::{Metadata, Node, NodeType};
 use super::{map_mode_from_go, FileType, Id, ReadBackend, WriteBackend, ALL_FILE_TYPES};
 
 #[derive(Clone)]
 pub struct LocalBackend {
     path: PathBuf,
+    post_create_command: Option<String>,
+    post_delete_command: Option<String>,
 }
 
 impl LocalBackend {
     pub fn new(path: &str) -> Result<Self> {
         let path = path.into();
         fs::create_dir_all(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            post_create_command: None,
+            post_delete_command: None,
+        })
     }
 
     fn path(&self, tpe: FileType, id: &Id) -> PathBuf {
@@ -35,6 +45,26 @@ impl LocalBackend {
             _ => self.path.join(tpe.name()).join(hex_id),
         }
     }
+
+    fn call_command(&self, tpe: FileType, id: &Id, filename: &Path, command: &str) -> Result<()> {
+        let id = id.to_hex();
+        let patterns = &["%file", "%type", "%id"];
+        let ac = AhoCorasick::new(patterns);
+        let replace_with = &[filename.to_str().unwrap(), tpe.name(), id.as_str()];
+        let actual_command = ac.replace_all(command, replace_with);
+        debug!("calling {actual_command}...");
+        let commands = parse_command::<()>(&actual_command)?.1;
+        let status = Command::new(commands[0]).args(&commands[1..]).status()?;
+        if !status.success() {
+            bail!(
+                "command was not successful for filename {}, type {}, id {}. {status}",
+                replace_with[0],
+                replace_with[1],
+                replace_with[2]
+            );
+        }
+        Ok(())
+    }
 }
 
 impl ReadBackend for LocalBackend {
@@ -42,7 +72,18 @@ impl ReadBackend for LocalBackend {
         self.path.to_str().unwrap()
     }
 
-    fn set_option(&mut self, _option: &str, _value: &str) -> Result<()> {
+    fn set_option(&mut self, option: &str, value: &str) -> Result<()> {
+        match option {
+            "post-create-command" => {
+                self.post_create_command = Some(value.to_string());
+            }
+            "post-delete-command" => {
+                self.post_delete_command = Some(value.to_string());
+            }
+            opt => {
+                warn!("Option {opt} is not supported! Ignoring it.");
+            }
+        }
         Ok(())
     }
 
@@ -114,6 +155,8 @@ impl ReadBackend for LocalBackend {
 
 impl WriteBackend for LocalBackend {
     fn create(&self) -> Result<()> {
+        trace!("creating repo at {:?}", self.path);
+
         for tpe in ALL_FILE_TYPES {
             fs::create_dir_all(self.path.join(tpe.name()))?;
         }
@@ -129,22 +172,64 @@ impl WriteBackend for LocalBackend {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .open(filename)?;
+            .open(&filename)?;
         file.set_len(buf.len().try_into()?)?;
         file.write_all(&buf)?;
         file.sync_all()?;
+        if let Some(command) = &self.post_create_command {
+            if let Err(err) = self.call_command(tpe, id, &filename, command) {
+                warn!("post-create: {err}");
+            }
+        }
         Ok(())
     }
 
     fn remove(&self, tpe: FileType, id: &Id, _cacheable: bool) -> Result<()> {
         trace!("removing tpe: {:?}, id: {}", &tpe, &id);
         let filename = self.path(tpe, id);
-        fs::remove_file(filename)?;
+        fs::remove_file(&filename)?;
+        if let Some(command) = &self.post_delete_command {
+            if let Err(err) = self.call_command(tpe, id, &filename, command) {
+                warn!("post-delete: {err}");
+            }
+        }
         Ok(())
     }
 }
 
-impl LocalBackend {
+#[derive(Clone)]
+pub struct LocalDestination {
+    path: PathBuf,
+    is_file: bool,
+}
+
+impl LocalDestination {
+    pub fn new(path: &str, create: bool, expect_file: bool) -> Result<Self> {
+        let is_dir = path.ends_with('/');
+        let path: PathBuf = path.into();
+        let is_file = path.is_file() || (!path.is_dir() && !is_dir && expect_file);
+
+        if create {
+            if is_file {
+                if let Some(path) = path.parent() {
+                    fs::create_dir_all(path)?;
+                }
+            } else {
+                fs::create_dir_all(&path)?;
+            }
+        }
+
+        Ok(Self { path, is_file })
+    }
+
+    fn path(&self, item: impl AsRef<Path>) -> PathBuf {
+        if self.is_file {
+            self.path.clone()
+        } else {
+            self.path.join(item)
+        }
+    }
+
     pub fn remove_dir(&self, dirname: impl AsRef<Path>) -> Result<()> {
         Ok(fs::remove_dir_all(dirname)?)
     }
@@ -160,7 +245,7 @@ impl LocalBackend {
     }
 
     pub fn set_times(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
         if let Some(mtime) = meta.mtime.map(|t| FileTime::from_system_time(t.into())) {
             set_file_mtime(&filename, mtime)?;
         }
@@ -171,7 +256,7 @@ impl LocalBackend {
     }
 
     pub fn set_user_group(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
 
         let user = meta
             .user
@@ -193,7 +278,7 @@ impl LocalBackend {
     }
 
     pub fn set_uid_gid(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
 
         let uid = meta.uid.map(Uid::from_raw);
         let gid = meta.gid.map(Gid::from_raw);
@@ -203,7 +288,7 @@ impl LocalBackend {
     }
 
     pub fn set_permission(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
 
         if let Some(mode) = meta.mode() {
             let mode = map_mode_from_go(*mode);
@@ -214,7 +299,7 @@ impl LocalBackend {
 
     // set_length sets the length of the given file. If it doesn't exist, create a new (empty) one with given length
     pub fn set_length(&self, item: impl AsRef<Path>, size: u64) -> Result<()> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
         OpenOptions::new()
             .create(true)
             .write(true)
@@ -224,24 +309,36 @@ impl LocalBackend {
     }
 
     pub fn create_special(&self, item: impl AsRef<Path>, node: &Node) -> Result<()> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
 
         match node.node_type() {
             NodeType::Symlink { linktarget } => {
                 symlink(linktarget, filename)?;
             }
             NodeType::Dev { device } => {
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(
+                    target_os = "macos",
+                    target_os = "openbsd",
+                    target_os = "freebsd"
+                )))]
                 let device = *device;
-                #[cfg(target_os = "macos")]
-                let device = *device as i32;
+                #[cfg(any(target_os = "macos", target_os = "openbsd"))]
+                let device = i32::try_from(*device)?;
+                #[cfg(target_os = "freebsd")]
+                let device = u32::try_from(*device)?;
                 mknod(&filename, SFlag::S_IFBLK, Mode::empty(), device)?;
             }
             NodeType::Chardev { device } => {
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(
+                    target_os = "macos",
+                    target_os = "openbsd",
+                    target_os = "freebsd"
+                )))]
                 let device = *device;
-                #[cfg(target_os = "macos")]
-                let device = *device as i32;
+                #[cfg(any(target_os = "macos", target_os = "openbsd"))]
+                let device = i32::try_from(*device)?;
+                #[cfg(target_os = "freebsd")]
+                let device = u32::try_from(*device)?;
                 mknod(&filename, SFlag::S_IFCHR, Mode::empty(), device)?;
             }
             NodeType::Fifo => {
@@ -256,7 +353,7 @@ impl LocalBackend {
     }
 
     pub fn read_at(&self, item: impl AsRef<Path>, offset: u64, length: u64) -> Result<Bytes> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
         let mut file = File::open(filename)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut vec = vec![0; length.try_into()?];
@@ -265,7 +362,7 @@ impl LocalBackend {
     }
 
     pub fn get_matching_file(&self, item: impl AsRef<Path>, size: u64) -> Option<File> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
         match fs::symlink_metadata(&filename) {
             Ok(meta) => {
                 if meta.is_file() && meta.len() == size {
@@ -279,7 +376,7 @@ impl LocalBackend {
     }
 
     pub fn write_at(&self, item: impl AsRef<Path>, offset: u64, data: &[u8]) -> Result<()> {
-        let filename = self.path.join(item);
+        let filename = self.path(item);
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)

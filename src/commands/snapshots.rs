@@ -22,7 +22,7 @@ pub(super) struct Opts {
         long,
         short = 'g',
         value_name = "CRITERION",
-        default_value = "host,paths"
+        default_value = "host,label,paths"
     )]
     group_by: SnapshotGroupCriterion,
 
@@ -134,7 +134,7 @@ pub(super) fn execute(
             table.add_rows(snapshots);
             println!("{table}");
         }
-        println!("{} snapshot(s)", count);
+        println!("{count} snapshot(s)");
     }
 
     Ok(())

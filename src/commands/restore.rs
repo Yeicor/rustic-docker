@@ -15,7 +15,7 @@ use rayon::ThreadPoolBuilder;
 
 use super::rustic_config::RusticConfig;
 use super::{bytes, progress_bytes, progress_counter, warm_up_wait};
-use crate::backend::{DecryptReadBackend, FileType, LocalBackend};
+use crate::backend::{DecryptReadBackend, FileType, LocalDestination};
 use crate::blob::{Node, NodeStreamer, NodeType, Tree};
 use crate::commands::helpers::progress_spinner;
 use crate::crypto::hash;
@@ -89,7 +89,7 @@ pub(super) fn execute(
     let index = IndexBackend::new(be, progress_counter(""))?;
     let node = Tree::node_from_path(&index, snap.tree, Path::new(path))?;
 
-    let dest = LocalBackend::new(&opts.dest)?;
+    let dest = LocalDestination::new(&opts.dest, true, !node.is_dir())?;
 
     let p = progress_spinner("collecting file information...");
     let (file_infos, stats) = allocate_and_collect(&dest, index.clone(), &node, &opts)?;
@@ -150,7 +150,7 @@ struct RestoreStats {
 
 /// collect restore information, scan existing files and allocate non-existing files
 fn allocate_and_collect(
-    dest: &LocalBackend,
+    dest: &LocalDestination,
     index: impl IndexedBackend + Unpin,
     node: &Node,
     opts: &Opts,
@@ -189,16 +189,21 @@ fn allocate_and_collect(
                 let path = entry.path();
                 match &removed_dir {
                     Some(dir) if path.starts_with(dir) => {}
-                    _ => {
-                        dest.remove_dir(path)
-                            .with_context(|| format!("error removing {path:?}"))?;
-                        removed_dir = Some(path.to_path_buf());
-                    }
+                    _ => match dest.remove_dir(path) {
+                        Ok(()) => {
+                            removed_dir = Some(path.to_path_buf());
+                        }
+                        Err(err) => {
+                            error!("error removing {path:?}: {err}");
+                        }
+                    },
                 }
             }
-            (true, false, false) => dest
-                .remove_file(entry.path())
-                .with_context(|| format!("error removing {:?}", entry.path()))?,
+            (true, false, false) => {
+                if let Err(err) = dest.remove_file(entry.path()) {
+                    error!("error removing {:?}: {err}", entry.path());
+                }
+            }
             (false, _, _) => {
                 additional_existing = true;
             }
@@ -327,7 +332,7 @@ fn allocate_and_collect(
 /// using the [`DecryptReadBackend`] `be` and writing them into the [`LocalBackend`] `dest`.
 fn restore_contents(
     be: &impl DecryptReadBackend,
-    dest: &LocalBackend,
+    dest: &LocalDestination,
     file_infos: FileInfos,
 ) -> Result<()> {
     let (filenames, restore_info, total_size, _) = file_infos.dissolve();
@@ -395,7 +400,7 @@ fn restore_contents(
 }
 
 fn restore_metadata(
-    dest: &LocalBackend,
+    dest: &LocalDestination,
     index: impl IndexedBackend + Unpin,
     node: &Node,
     opts: &Opts,
@@ -430,7 +435,7 @@ fn restore_metadata(
     Ok(())
 }
 
-fn set_metadata(dest: &LocalBackend, path: &PathBuf, node: &Node, opts: &Opts) {
+fn set_metadata(dest: &LocalDestination, path: &PathBuf, node: &Node, opts: &Opts) {
     debug!("setting metadata for {:?}", path);
     dest.create_special(path, node)
         .unwrap_or_else(|_| warn!("restore {:?}: creating special file failed.", path));
@@ -507,7 +512,7 @@ impl FileInfos {
     /// Returns the computed length of the file
     fn add_file(
         &mut self,
-        dest: &LocalBackend,
+        dest: &LocalDestination,
         file: &Node,
         name: PathBuf,
         index: &impl IndexedBackend,
