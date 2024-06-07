@@ -5,7 +5,7 @@ use crate::backend::{FileType, RepoFile};
 use crate::blob::BlobType;
 use crate::id::Id;
 
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigFile {
     pub version: u32,
     pub id: Id,
@@ -19,9 +19,17 @@ pub struct ConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treepack_growfactor: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub treepack_size_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datapack_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datapack_growfactor: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datapack_size_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_packsize_tolerate_percent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_packsize_tolerate_percent: Option<u32>,
 }
 
 impl RepoFile for ConfigFile {
@@ -36,6 +44,7 @@ const DEFAULT_DATA_SIZE: u32 = 32 * MB;
 // the default factor used for repo-size dependent pack size.
 // 32 * sqrt(reposize in bytes) = 1 MB * sqrt(reposize in GB)
 const DEFAULT_GROW_FACTOR: u32 = 32;
+const DEFAULT_SIZE_LIMIT: u32 = u32::MAX;
 
 impl ConfigFile {
     pub fn new(version: u32, id: Id, poly: u64) -> Self {
@@ -43,12 +52,7 @@ impl ConfigFile {
             version,
             id,
             chunker_polynomial: format!("{:x}", poly),
-            is_hot: None,
-            compression: None,
-            treepack_size: None,
-            treepack_growfactor: None,
-            datapack_size: None,
-            datapack_growfactor: None,
+            ..Self::default()
         }
     }
 
@@ -65,16 +69,28 @@ impl ConfigFile {
         }
     }
 
-    pub fn packsize(&self, blob: BlobType) -> (u32, u32) {
+    pub fn packsize(&self, blob: BlobType) -> (u32, u32, u32) {
         match blob {
             BlobType::Tree => (
                 self.treepack_size.unwrap_or(DEFAULT_TREE_SIZE),
                 self.treepack_growfactor.unwrap_or(DEFAULT_GROW_FACTOR),
+                self.treepack_size_limit.unwrap_or(DEFAULT_SIZE_LIMIT),
             ),
             BlobType::Data => (
                 self.datapack_size.unwrap_or(DEFAULT_DATA_SIZE),
                 self.datapack_growfactor.unwrap_or(DEFAULT_GROW_FACTOR),
+                self.datapack_size_limit.unwrap_or(DEFAULT_SIZE_LIMIT),
             ),
         }
+    }
+
+    pub fn packsize_ok_percents(&self) -> (u32, u32) {
+        (
+            self.min_packsize_tolerate_percent.unwrap_or(30),
+            match self.max_packsize_tolerate_percent {
+                None | Some(0) => u32::MAX,
+                Some(percent) => percent,
+            },
+        )
     }
 }

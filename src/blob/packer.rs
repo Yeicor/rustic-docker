@@ -1,13 +1,11 @@
 use integer_sqrt::IntegerSquareRoot;
-use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Result};
 use binrw::{io::Cursor, BinWrite};
+use bytes::{Bytes, BytesMut};
 use chrono::Local;
-use tempfile::tempfile;
 use tokio::{spawn, task::JoinHandle};
 use zstd::encode_all;
 
@@ -25,25 +23,42 @@ const MAX_SIZE: u32 = 4076 * MB;
 const MAX_COUNT: u32 = 10_000;
 const MAX_AGE: Duration = Duration::from_secs(300);
 
-struct PackSizer {
+pub struct PackSizer {
     default_size: u32,
     grow_factor: u32,
+    size_limit: u32,
     current_size: u64,
+    min_packsize_tolerate_percent: u32,
+    max_packsize_tolerate_percent: u32,
 }
 
 impl PackSizer {
     pub fn from_config(config: &ConfigFile, blob_type: BlobType, current_size: u64) -> Self {
-        let (default_size, grow_factor) = config.packsize(blob_type);
+        let (default_size, grow_factor, size_limit) = config.packsize(blob_type);
+        let (min_packsize_tolerate_percent, max_packsize_tolerate_percent) =
+            config.packsize_ok_percents();
         Self {
             default_size,
             grow_factor,
+            size_limit,
             current_size,
+            min_packsize_tolerate_percent,
+            max_packsize_tolerate_percent,
         }
     }
 
     pub fn pack_size(&self) -> u32 {
         (self.current_size.integer_sqrt() as u32 * self.grow_factor + self.default_size)
+            .min(self.size_limit)
             .min(MAX_SIZE)
+    }
+
+    // returns whether the given size is not too small or too large
+    pub fn size_ok(&self, size: u32) -> bool {
+        let target_size = self.pack_size();
+        // Note: we cast to u64 so that no overflow can occur in the multiplications
+        size as u64 * 100 >= target_size as u64 * self.min_packsize_tolerate_percent as u64
+            && size as u64 * 100 <= target_size as u64 * self.max_packsize_tolerate_percent as u64
     }
 
     fn add_size(&mut self, added: u32) {
@@ -53,7 +68,7 @@ impl PackSizer {
 pub struct Packer<BE: DecryptWriteBackend> {
     be: BE,
     blob_type: BlobType,
-    file: File,
+    file: BytesMut,
     size: u32,
     count: u32,
     created: SystemTime,
@@ -84,7 +99,7 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
         Ok(Self {
             be,
             blob_type,
-            file: tempfile()?,
+            file: BytesMut::new(),
             size: 0,
             count: 0,
             created: SystemTime::now(),
@@ -104,7 +119,8 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
 
     pub async fn write_data(&mut self, data: &[u8]) -> Result<u32> {
         self.hasher.update(data);
-        let len = self.file.write(data)?.try_into()?;
+        let len = data.len().try_into()?;
+        self.file.extend_from_slice(data);
         self.size += len;
         Ok(len)
     }
@@ -145,7 +161,7 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
                 None,
             ),
             Some(level) => (
-                key.encrypt_data(&encode_all(&*data, level)?)
+                key.encrypt_data(&encode_all(data, level)?)
                     .map_err(|_| anyhow!("crypto error"))?,
                 NonZeroU32::new(data_len),
             ),
@@ -265,8 +281,8 @@ impl<BE: DecryptWriteBackend> Packer<BE> {
 
         // write file to backend
         let index = std::mem::take(&mut self.index);
-        let file = std::mem::replace(&mut self.file, tempfile()?);
-        self.file_writer.add(index, file, id).await?;
+        let file = std::mem::replace(&mut self.file, BytesMut::new());
+        self.file_writer.add(index, file.into(), id).await?;
 
         Ok(())
     }
@@ -284,13 +300,12 @@ struct FileWriter<BE: DecryptWriteBackend> {
 }
 
 impl<BE: DecryptWriteBackend> FileWriter<BE> {
-    async fn add(&mut self, mut index: IndexPack, mut file: File, id: Id) -> Result<()> {
+    async fn add(&mut self, mut index: IndexPack, file: Bytes, id: Id) -> Result<()> {
         let be = self.be.clone();
         let indexer = self.indexer.clone();
         let cacheable = self.cacheable;
         let new_future = spawn(async move {
-            file.seek(SeekFrom::Start(0))?;
-            be.write_file(FileType::Pack, &id, cacheable, file).await?;
+            be.write_bytes(FileType::Pack, &id, cacheable, file).await?;
             index.time = Some(Local::now());
             indexer.write().await.add(index).await?;
             Ok(())

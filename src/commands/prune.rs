@@ -5,61 +5,81 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, Result};
 use bytesize::ByteSize;
 use chrono::{DateTime, Duration, Local};
-use clap::Parser;
+use clap::{AppSettings, Parser};
 use derive_more::Add;
 use futures::{future, TryStreamExt};
 use vlog::*;
 
-use super::{bytes, no_progress, progress_bytes, progress_counter};
-use crate::backend::{DecryptFullBackend, DecryptReadBackend, FileType};
-use crate::blob::{BlobType, BlobTypeMap, NodeType, Repacker, TreeStreamerOnce};
+use super::{bytes, no_progress, progress_bytes, progress_counter, wait, warm_up, warm_up_command};
+use crate::backend::{Cache, DecryptFullBackend, DecryptReadBackend, FileType};
+use crate::blob::{BlobType, BlobTypeMap, NodeType, PackSizer, Repacker, TreeStreamerOnce};
 use crate::id::Id;
-use crate::index::{IndexBackend, IndexCollector, IndexType, IndexedBackend, Indexer};
+use crate::index::{IndexBackend, IndexCollector, IndexType, IndexedBackend, Indexer, ReadIndex};
 use crate::repo::{ConfigFile, IndexBlob, IndexFile, IndexPack, SnapshotFile};
 
 #[derive(Parser)]
+#[clap(global_setting(AppSettings::DeriveDisplayOrder))]
 pub(super) struct Opts {
-    /// define maximum data to repack in % of reposize or as size (e.g. '5b', '2 kB', '3M', '4TiB') or 'unlimited'
+    /// Don't remove anything, only show what would be done
+    #[clap(long, short = 'n')]
+    pub(crate) dry_run: bool,
+
+    /// Define maximum data to repack in % of reposize or as size (e.g. '5b', '2 kB', '3M', '4TiB') or 'unlimited'
     #[clap(long, value_name = "LIMIT", default_value = "unlimited")]
     max_repack: LimitOption,
 
-    /// tolerate limit of unused data in % of reposize after pruning or as size (e.g. '5b', '2 kB', '3M', '4TiB') or 'unlimited'
+    /// Tolerate limit of unused data in % of reposize after pruning or as size (e.g. '5b', '2 kB', '3M', '4TiB') or 'unlimited'
     #[clap(long, value_name = "LIMIT", default_value = "5%")]
     max_unused: LimitOption,
 
-    /// only repack packs which are cacheable [default: true for a hot/cold repository, else false]
-    #[clap(long, value_name = "TRUE/FALSE")]
-    repack_cacheable_only: Option<bool>,
+    /// Minimum duration (e.g. 90d) to keep packs before repacking or removing. More recently created
+    /// packs won't be repacked or marked for deletion within this prune run.
+    #[clap(long, value_name = "DURATION", default_value = "0d")]
+    keep_pack: humantime::Duration,
 
-    /// minimum duration (e.g. 10m) to keep packs marked for deletion
+    /// Minimum duration (e.g. 10m) to keep packs marked for deletion. More recently marked packs won't be
+    /// deleted within this prune run.
     #[clap(long, value_name = "DURATION", default_value = "23h")]
     keep_delete: humantime::Duration,
 
-    /// delete files immediately instead of marking them. This also removes all already marked files.
+    /// Delete files immediately instead of marking them. This also removes all files already marked for deletion.
     /// WARNING: Only use if you are sure the repository is not accessed by parallel processes!
     #[clap(long)]
     instant_delete: bool,
 
-    /// minimum duration (e.g. 90d) to keep packs before repacking or removing
-    #[clap(long, value_name = "DURATION", default_value = "0d")]
-    keep_pack: humantime::Duration,
+    /// Only remove unneded pack file from local cache. Do not change the repository at all.
+    #[clap(long)]
+    cache_only: bool,
 
-    /// simply copy blobs when repacking instead of decrypting; possibly compressing; encrypting
+    /// Simply copy blobs when repacking instead of decrypting; possibly compressing; encrypting
     #[clap(long)]
     fast_repack: bool,
 
-    /// repack packs containing uncompressed blobs. This cannot be used with --fast-repack.
+    /// Repack packs containing uncompressed blobs. This cannot be used with --fast-repack.
     /// Implies --max-unused=0.
     #[clap(long, conflicts_with = "fast-repack")]
     repack_uncompressed: bool,
 
-    /// don't remove anything, only show what would be done
-    #[clap(long, short = 'n')]
-    pub(crate) dry_run: bool,
+    /// Only repack packs which are cacheable [default: true for a hot/cold repository, else false]
+    #[clap(long, value_name = "TRUE/FALSE")]
+    repack_cacheable_only: Option<bool>,
+
+    /// Warm up needed data pack files by only requesting them without processing
+    #[clap(long)]
+    warm_up: bool,
+
+    /// Warm up needed data pack files by running the command with %id replaced by pack id
+    #[clap(long, conflicts_with = "warm-up")]
+    warm_up_command: Option<String>,
+
+    /// Duration (e.g. 10m) to wait after warm up before doing the actual restore
+    #[clap(long, value_name = "DURATION", conflicts_with = "dry-run")]
+    warm_up_wait: Option<humantime::Duration>,
 }
 
 pub(super) async fn execute(
     be: &(impl DecryptFullBackend + Unpin),
+    cache: Option<Cache>,
     opts: Opts,
     config: ConfigFile,
     ignore_snaps: Vec<Id>,
@@ -85,9 +105,27 @@ pub(super) async fn execute(
     }
     p.finish();
 
-    let used_ids = {
-        let indexed_be = IndexBackend::new_from_index(&be.clone(), index_collector.into_index());
-        find_used_blobs(&indexed_be, ignore_snaps).await?
+    if let Some(cache) = &cache {
+        v1!("cleaning up packs from cache...");
+        cache
+            .remove_not_in_list(FileType::Pack, index_collector.tree_packs())
+            .await?;
+    }
+    match (cache.is_some(), opts.cache_only) {
+        (true, true) => return Ok(()),
+        (false, true) => {
+            ve1!("Warning: option --cache-only used without a cache.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let (used_ids, total_size) = {
+        let index = index_collector.into_index();
+        let total_size = BlobTypeMap::<()>::default().map(|tpe, _| index.total_size(&tpe));
+        let indexed_be = IndexBackend::new_from_index(&be.clone(), index);
+        let used_ids = find_used_blobs(&indexed_be, ignore_snaps).await?;
+        (used_ids, total_size)
     };
 
     // list existing pack files
@@ -104,17 +142,30 @@ pub(super) async fn execute(
     let repack_cacheable_only = opts
         .repack_cacheable_only
         .unwrap_or_else(|| config.is_hot == Some(true));
+    let pack_sizer = total_size.map(|tpe, size| PackSizer::from_config(&config, tpe, size));
     pruner.decide_packs(
         Duration::from_std(*opts.keep_pack)?,
         Duration::from_std(*opts.keep_delete)?,
         repack_cacheable_only,
         opts.repack_uncompressed,
+        &pack_sizer,
     )?;
     pruner.decide_repack(&opts.max_repack, &opts.max_unused, opts.repack_uncompressed);
     pruner.check_existing_packs()?;
     pruner.filter_index_files(opts.instant_delete);
     pruner.print_stats();
 
+    if opts.warm_up {
+        v1!("warming up needed data pack files...");
+        warm_up(be, pruner.repack_packs()).await?;
+    } else if opts.warm_up_command.is_some() {
+        v1!("warming up needed data pack files...");
+        warm_up_command(
+            pruner.repack_packs(),
+            opts.warm_up_command.as_ref().unwrap(),
+        )?;
+    }
+    wait(opts.warm_up_wait).await;
     if !opts.dry_run {
         pruner.do_prune(be, opts, config).await?;
     }
@@ -216,7 +267,7 @@ impl PruneIndex {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackToDo {
     Undecided,
     Keep,
@@ -329,11 +380,19 @@ impl PrunePack {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum RepackReason {
+    PartlyUsed,
+    ToCompress,
+    SizeMismatch,
+}
+use RepackReason::*;
+
 struct Pruner {
     time: DateTime<Local>,
     used_ids: HashMap<Id, u8>,
     existing_packs: HashMap<Id, u32>,
-    repack_candidates: Vec<(PackInfo, usize, usize)>,
+    repack_candidates: Vec<(PackInfo, RepackReason, usize, usize)>,
     index_files: Vec<PruneIndex>,
     stats: PruneStats,
 }
@@ -439,6 +498,7 @@ impl Pruner {
         keep_delete: Duration,
         repack_cacheable_only: bool,
         repack_uncompressed: bool,
+        pack_sizer: &BlobTypeMap<PackSizer>,
     ) -> Result<()> {
         // first process all marked packs then the unmarked ones:
         // - first processed packs are more likely to have all blobs seen as unused
@@ -453,7 +513,13 @@ impl Pruner {
                     .filter(|(_, p)| p.delete_mark == mark_case)
                 {
                     let pi = PackInfo::from_pack(pack, &mut self.used_ids);
+
+                    // Various checks to determine if packs need to be kept
                     let too_young = pack.time > Some(self.time - keep_pack);
+                    let keep_uncacheable = repack_cacheable_only && !pack.blob_type.is_cacheable();
+
+                    let to_compress = repack_uncompressed && !pack.is_compressed();
+                    let size_mismatch = !pack_sizer[pack.blob_type].size_ok(pack.size);
 
                     match (pack.delete_mark, pi.used_blobs, pi.unused_blobs) {
                         (false, 0, _) => {
@@ -469,14 +535,20 @@ impl Pruner {
                         (false, 1.., 0) => {
                             // used pack
                             self.stats.packs.used += 1;
-                            if too_young
-                                || !repack_uncompressed
-                                || pack.is_compressed()
-                                || repack_cacheable_only && !pack.blob_type.is_cacheable()
-                            {
+                            if too_young || keep_uncacheable {
                                 pack.set_todo(PackToDo::Keep, &pi, &mut self.stats);
+                            } else if to_compress {
+                                self.repack_candidates
+                                    .push((pi, ToCompress, index_num, pack_num));
+                            } else if size_mismatch {
+                                self.repack_candidates.push((
+                                    pi,
+                                    SizeMismatch,
+                                    index_num,
+                                    pack_num,
+                                ));
                             } else {
-                                self.repack_candidates.push((pi, index_num, pack_num));
+                                pack.set_todo(PackToDo::Keep, &pi, &mut self.stats);
                             }
                         }
 
@@ -484,13 +556,13 @@ impl Pruner {
                             // partly used pack
                             self.stats.packs.partly_used += 1;
 
-                            if too_young || repack_cacheable_only && !pack.blob_type.is_cacheable()
-                            {
+                            if too_young || keep_uncacheable {
                                 // keep packs which are too young and non-cacheable packs if requested
                                 pack.set_todo(PackToDo::Keep, &pi, &mut self.stats);
                             } else {
                                 // other partly used pack => candidate for repacking
-                                self.repack_candidates.push((pi, index_num, pack_num))
+                                self.repack_candidates
+                                    .push((pi, PartlyUsed, index_num, pack_num))
                             }
                         }
                         (true, 0, _) => {
@@ -537,23 +609,40 @@ impl Pruner {
         };
 
         self.repack_candidates.sort_unstable_by_key(|rc| rc.0);
+        let mut resize_packs: BlobTypeMap<Vec<_>> = Default::default();
+        let mut do_repack: BlobTypeMap<bool> = Default::default();
 
-        for (pi, index_num, pack_num) in std::mem::take(&mut self.repack_candidates) {
+        for (pi, repack_reason, index_num, pack_num) in std::mem::take(&mut self.repack_candidates)
+        {
             let pack = &mut self.index_files[index_num].packs[pack_num];
 
             let repack_size_new =
                 self.stats.total_size().repack + (pi.unused_size + pi.used_size) as u64;
             if repack_size_new >= max_repack
-                || (pi.blob_type != BlobType::Tree
-                    && self.stats.total_size().unused_after_prune() < max_unused)
+                || (self.stats.total_size().unused_after_prune() < max_unused
+                    && repack_reason == PartlyUsed
+                    && pi.blob_type == BlobType::Data)
             {
                 pack.set_todo(PackToDo::Keep, &pi, &mut self.stats);
+            } else if repack_reason == SizeMismatch {
+                resize_packs[pack.blob_type].push((pi, index_num, pack_num));
             } else {
                 pack.set_todo(PackToDo::Repack, &pi, &mut self.stats);
+                do_repack[pack.blob_type] = true;
             }
         }
-        self.repack_candidates.clear();
-        self.repack_candidates.shrink_to_fit();
+        // resize_packs are only repacked if at least two packs of the blob_type are repacked
+        for (blob_type, resize_packs) in resize_packs {
+            let todo = if do_repack[blob_type] || resize_packs.len() > 1 {
+                PackToDo::Repack
+            } else {
+                PackToDo::Keep
+            };
+            for (pi, index_num, pack_num) in resize_packs {
+                let pack = &mut self.index_files[index_num].packs[pack_num];
+                pack.set_todo(todo, &pi, &mut self.stats);
+            }
+        }
     }
 
     fn check_existing_packs(&mut self) -> Result<()> {
@@ -726,6 +815,15 @@ impl Pruner {
             self.index_files.len(),
             self.stats.index_files
         );
+    }
+
+    fn repack_packs(&self) -> Vec<Id> {
+        self.index_files
+            .iter()
+            .flat_map(|index| &index.packs)
+            .filter(|pack| pack.to_do == PackToDo::Repack)
+            .map(|pack| pack.id)
+            .collect()
     }
 
     async fn do_prune(

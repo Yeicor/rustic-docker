@@ -8,7 +8,7 @@ use clap::Parser;
 use ignore::{overrides::OverrideBuilder, DirEntry, Walk, WalkBuilder};
 use users::{Groups, Users, UsersCache};
 
-use super::{node::Metadata, Node, ReadSource};
+use super::{node::Metadata, node::NodeType, Node, ReadSource};
 
 pub struct LocalSource {
     builder: WalkBuilder,
@@ -31,11 +31,11 @@ pub struct LocalSourceOptions {
     #[clap(long, short = 'g')]
     glob: Vec<String>,
 
-    /// Read glob patterns to exclude/include from a file (can be specified multiple times)
+    /// Read glob patterns to exclude/include from this file (can be specified multiple times)
     #[clap(long, value_name = "FILE")]
     glob_file: Vec<String>,
 
-    /// Exclude contents of directories containing filename (can be specified multiple times)
+    /// Exclude contents of directories containing this filename (can be specified multiple times)
     #[clap(long, value_name = "FILE")]
     exclude_if_present: Vec<String>,
 
@@ -152,7 +152,7 @@ impl Iterator for LocalSource {
 
 // map_entry: turn entry into (Path, Node)
 fn map_entry(entry: DirEntry, with_atime: bool, cache: &UsersCache) -> Result<(PathBuf, Node)> {
-    let name = entry.file_name().to_os_string();
+    let name = entry.file_name();
     let m = entry.metadata()?;
 
     let uid = m.uid();
@@ -195,20 +195,25 @@ fn map_entry(entry: DirEntry, with_atime: bool, cache: &UsersCache) -> Result<(P
     let filetype = m.file_type();
 
     let node = if m.is_dir() {
-        Node::new_dir(name, meta)
+        Node::new_node(name, NodeType::Dir, meta)
     } else if m.is_symlink() {
         let target = read_link(entry.path())?;
-        Node::new_symlink(name, target, meta)
+        let node_type = NodeType::Symlink {
+            linktarget: target.to_str().expect("no unicode").to_string(),
+        };
+        Node::new_node(name, node_type, meta)
     } else if filetype.is_block_device() {
-        Node::new_dev(name, meta, m.rdev())
+        let node_type = NodeType::Dev { device: m.rdev() };
+        Node::new_node(name, node_type, meta)
     } else if filetype.is_char_device() {
-        Node::new_chardev(name, meta, m.rdev())
+        let node_type = NodeType::Chardev { device: m.rdev() };
+        Node::new_node(name, node_type, meta)
     } else if filetype.is_fifo() {
-        Node::new_fifo(name, meta)
+        Node::new_node(name, NodeType::Fifo, meta)
     } else if filetype.is_socket() {
-        Node::new_socket(name, meta)
+        Node::new_node(name, NodeType::Socket, meta)
     } else {
-        Node::new_file(name, meta)
+        Node::new_node(name, NodeType::File, meta)
     };
     Ok((entry.path().to_path_buf(), node))
 }
