@@ -93,7 +93,7 @@ jobs:
     needs: [ mirror ]
     if: ${{ needs.mirror.outputs.updatedrefs != '[]' }}
     strategy:
-      fail-fast: false  # TODO: Ignore errors for tags, not for main?
+      fail-fast: false
       matrix:
         ref: ${{fromJSON(needs.mirror.outputs.updatedrefs)}}
     permissions:
