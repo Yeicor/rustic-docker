@@ -4,10 +4,10 @@ use std::path::Path;
 
 use super::progress_counter;
 use super::rustic_config::RusticConfig;
-use crate::backend::DecryptReadBackend;
 use crate::blob::{NodeStreamer, Tree};
 use crate::index::IndexBackend;
-use crate::repo::{SnapshotFile, SnapshotFilter};
+use crate::repofile::{SnapshotFile, SnapshotFilter};
+use crate::repository::OpenRepository;
 
 #[derive(Parser)]
 pub(super) struct Opts {
@@ -20,18 +20,19 @@ pub(super) struct Opts {
 }
 
 pub(super) fn execute(
-    be: &impl DecryptReadBackend,
+    repo: OpenRepository,
     mut opts: Opts,
     config_file: RusticConfig,
 ) -> Result<()> {
     config_file.merge_into("snapshot-filter", &mut opts.filter)?;
+    let be = &repo.dbe;
 
     let (id, path) = opts.snap.split_once(':').unwrap_or((&opts.snap, ""));
     let snap = SnapshotFile::from_str(be, id, |sn| sn.matches(&opts.filter), progress_counter(""))?;
     let index = IndexBackend::new(be, progress_counter(""))?;
-    let tree = Tree::subtree_id(&index, snap.tree, Path::new(path))?;
+    let node = Tree::node_from_path(&index, snap.tree, Path::new(path))?;
 
-    for item in NodeStreamer::new(index, tree)? {
+    for item in NodeStreamer::new(index, &node)? {
         let (path, _) = item?;
         println!("{:?} ", path);
     }

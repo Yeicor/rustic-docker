@@ -25,33 +25,40 @@ pub struct RcloneBackend {
     _child_data: Arc<ChildToKill>,
 }
 
+fn rclone_version() -> Result<(i32, i32, i32)> {
+    let rclone_version_output = Command::new("rclone").arg("version").output()?.stdout;
+    let rclone_version = str::from_utf8(&rclone_version_output)?
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("'rclone version' doesn't give any output"))?
+        .trim_start_matches(|c: char| !c.is_numeric());
+
+    let versions: Vec<&str> = rclone_version.split(&['.', '-', ' '][..]).collect();
+    let major = versions[0].parse::<i32>()?;
+    let minor = versions[1].parse::<i32>()?;
+    let patch = versions[2].parse::<i32>()?;
+    Ok((major, minor, patch))
+}
+
 impl RcloneBackend {
     pub fn new(url: &str) -> Result<Self> {
-        let rclone_version_output = Command::new("rclone").arg("version").output()?.stdout;
-        let rclone_version = str::from_utf8(&rclone_version_output)?
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow!("'rclone version' doesn't give any output"))?
-            .strip_prefix("rclone v")
-            .ok_or_else(|| anyhow!("output of 'rclone version' doesn't start with 'rclone v'"))?;
-
-        let versions: Vec<&str> = rclone_version.split(&['.', '-'][..]).collect();
-        let major = versions[0].parse::<i32>()?;
-        let minor = versions[1].parse::<i32>()?;
-        let patch = versions[2].parse::<i32>()?;
-
-        if major
-            .cmp(&1)
-            .then(minor.cmp(&52))
-            .then(patch.cmp(&2))
-            .is_lt()
-        {
-            // for rclone < 1.52.2 setting user/password via env variable doesn't work. This means
-            // we are setting up an rclone without authentication which is a security issue!
-            // (however, it still works, so we give a warning)
-            warn!(
-                "Using rclone without authentication! Upgrade to rclone >= 1.52.2 (current version: {rclone_version})!"
+        match rclone_version() {
+            Ok((major, minor, patch)) => {
+                if major
+                    .cmp(&1)
+                    .then(minor.cmp(&52))
+                    .then(patch.cmp(&2))
+                    .is_lt()
+                {
+                    // for rclone < 1.52.2 setting user/password via env variable doesn't work. This means
+                    // we are setting up an rclone without authentication which is a security issue!
+                    // (however, it still works, so we give a warning)
+                    warn!(
+                "Using rclone without authentication! Upgrade to rclone >= 1.52.2 (current version: {major}.{minor}.{patch})!"
             );
+                }
+            }
+            Err(err) => warn!("Could not determine rclone version: {err}"),
         }
 
         let user = Alphanumeric.sample_string(&mut thread_rng(), 12);
@@ -83,7 +90,9 @@ impl RcloneBackend {
             match line.find(SEARCHSTRING) {
                 Some(result) => {
                     if let Some(url) = line.get(result + SEARCHSTRING.len()..) {
-                        break url.trim_end().to_string();
+                        // rclone > 1.61 adds brackets around the url, so remove those
+                        let brackets: &[_] = &['[', ']'];
+                        break url.trim_end().trim_matches(brackets).to_string();
                     }
                 }
                 None if !line.is_empty() => info!("rclone output: {line}"),
