@@ -41,6 +41,7 @@ jobs:
           updated_refs="["
           cd ${GITHUB_WORKSPACE}_original/
           for bt in $(git branch | cut -c 3-; git tag | grep -E "^v.*"); do 
+            echo " ============= Processing branch or tag $bt ============= "
             # Delete all non-custom files from our repository (in case of deletions in the original repository)
             cd ${GITHUB_WORKSPACE}/
             if [[ "$bt" == "main" ]]; then
@@ -55,7 +56,6 @@ jobs:
 
             # Copy all files from the original repository
             cd ${GITHUB_WORKSPACE}_original/
-            echo "Processing branch or tag $bt..."
             git checkout "$bt"
             rsync -a --exclude='.git' --exclude='.github' ${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
             bt_is_tag="false"
@@ -67,9 +67,11 @@ jobs:
             cd ${GITHUB_WORKSPACE}/
             git config --global user.name 'yeicor-mirror.yml'
             git config --global user.email 'Yeicor@users.noreply.github.com'
-            git add -v .
+            git add .
             # FIXME: Detect no changes for tags...
-            if [[ `git status --porcelain >/dev/null` ]]; then # Changes
+            if [[ `git status --porcelain` ]]; then # Changes
+              echo "Changes detected..."
+              git diff
               git commit -am "Automated sync of original sources"
               if [[ "$bt_is_tag" == "true" ]]; then
                 git tag -f "$bt"
