@@ -2,11 +2,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::Read;
 use std::num::NonZeroU32;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{Local, TimeZone, Utc};
+use chrono::{DateTime, Local, Utc};
 use clap::{AppSettings, Parser};
 use derive_getters::Dissolve;
 use ignore::{DirEntry, WalkBuilder};
@@ -42,6 +41,10 @@ pub(super) struct Opts {
     /// Use numeric ids instead of user/group when restoring uid/gui
     #[clap(long)]
     numeric_id: bool,
+
+    /// Don't restore ownership (user/group)
+    #[clap(long, conflicts_with = "numeric_id")]
+    no_ownership: bool,
 
     /// Warm up needed data pack files by only requesting them without processing
     #[clap(long)]
@@ -439,15 +442,19 @@ fn set_metadata(dest: &LocalDestination, path: &PathBuf, node: &Node, opts: &Opt
     debug!("setting metadata for {:?}", path);
     dest.create_special(path, node)
         .unwrap_or_else(|_| warn!("restore {:?}: creating special file failed.", path));
-    if opts.numeric_id {
-        dest.set_uid_gid(path, node.meta())
-            .unwrap_or_else(|_| warn!("restore {:?}: setting UID/GID failed.", path));
-    } else {
-        dest.set_user_group(path, node.meta())
-            .unwrap_or_else(|_| warn!("restore {:?}: setting User/Group failed.", path));
+    match (opts.no_ownership, opts.numeric_id) {
+        (true, _) => {}
+        (false, true) => dest
+            .set_uid_gid(path, node.meta())
+            .unwrap_or_else(|_| warn!("restore {:?}: setting UID/GID failed.", path)),
+        (false, false) => dest
+            .set_user_group(path, node.meta())
+            .unwrap_or_else(|_| warn!("restore {:?}: setting User/Group failed.", path)),
     }
     dest.set_permission(path, node.meta())
         .unwrap_or_else(|_| warn!("restore {:?}: chmod failed.", path));
+    dest.set_extended_attributes(path, &node.meta.extended_attributes)
+        .unwrap_or_else(|_| warn!("restore {:?}: setting extended attributes failed.", path));
     dest.set_times(path, node.meta())
         .unwrap_or_else(|_| warn!("restore {:?}: setting file times failed.", path));
 }
@@ -524,10 +531,10 @@ impl FileInfos {
         if !ignore_mtime {
             if let Some(meta) = open_file.as_ref().map(|f| f.metadata()).transpose()? {
                 // TODO: This is the same logic as in backend/ignore.rs => consollidate!
-                let mtime = Utc
-                    .timestamp_opt(meta.mtime(), meta.mtime_nsec().try_into()?)
-                    .single()
-                    .map(|dt| dt.with_timezone(&Local));
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .map(|t| DateTime::<Utc>::from(t).with_timezone(&Local));
                 if meta.len() == file_meta.size && mtime == file_meta.mtime {
                     // File exists with fitting mtime => we suspect this file is ok!
                     debug!("file {name:?} exists with suitable size and mtime, accepting it!");
@@ -541,7 +548,7 @@ impl FileInfos {
         self.names.push(name);
         let mut file_pos = 0;
         let mut has_unmatched = false;
-        for id in file.content().iter() {
+        for id in file.content.iter().flatten() {
             let ie = index
                 .get_data(id)
                 .ok_or_else(|| anyhow!("did not find id {} in index", id))?;
@@ -581,8 +588,8 @@ impl FileInfos {
 
         match (has_unmatched, open_file.is_some()) {
             (true, true) => Ok(AddFileResult::Modify(file_pos)),
-            (true, false) => Ok(AddFileResult::New(file_pos)),
-            (false, _) => Ok(AddFileResult::Verified),
+            (false, true) => Ok(AddFileResult::Verified),
+            (_, false) => Ok(AddFileResult::New(file_pos)),
         }
     }
 

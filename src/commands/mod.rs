@@ -20,12 +20,14 @@ mod completions;
 mod config;
 mod copy;
 mod diff;
+mod dump;
 mod forget;
 mod helpers;
 mod init;
 mod key;
 mod list;
 mod ls;
+mod merge_cmd;
 mod prune;
 mod repair;
 mod repoinfo;
@@ -62,7 +64,7 @@ struct Opts {
 
 #[serde_as]
 #[derive(Default, Parser, Deserialize, Merge)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 struct GlobalOpts {
     /// Use this log level [default: info]
     #[clap(long, global = true, env = "RUSTIC_LOG_LEVEL")]
@@ -73,6 +75,22 @@ struct GlobalOpts {
     /// Note: warnings and errors are still additionally printed unless they are ignored by --log-level
     #[clap(long, global = true, env = "RUSTIC_LOG_FILE", value_name = "LOGFILE")]
     log_file: Option<PathBuf>,
+
+    /// Don't show any progress bar
+    #[clap(long, global = true, env = "RUSTIC_NO_PROGRESS")]
+    #[merge(strategy=merge::bool::overwrite_false)]
+    no_progress: bool,
+
+    /// Interval to update progress bars
+    #[clap(
+        long,
+        global = true,
+        env = "RUSTIC_PROGRESS_INTERVAL",
+        value_name = "DURATION",
+        conflicts_with = "no-progress"
+    )]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    progress_interval: Option<humantime::Duration>,
 }
 
 #[derive(Subcommand)]
@@ -100,6 +118,9 @@ enum Command {
     /// Note that the exclude options only apply for comparison with a local path
     Diff(diff::Opts),
 
+    /// dump the contents of a file in a snapshot to stdout
+    Dump(dump::Opts),
+
     /// Remove snapshots from the repository
     Forget(forget::Opts),
 
@@ -114,6 +135,9 @@ enum Command {
 
     /// List file contents of a snapshot
     Ls(ls::Opts),
+
+    /// Merge snapshots
+    Merge(merge_cmd::Opts),
 
     /// Show a detailed overview of the snapshots within the repository
     Snapshots(snapshots::Opts),
@@ -138,7 +162,7 @@ enum Command {
 }
 
 pub fn execute() -> Result<()> {
-    let command: Vec<_> = std::env::args_os().into_iter().collect();
+    let command: Vec<_> = std::env::args_os().collect();
     let args = Opts::parse_from(&command);
 
     // get global options from command line / env and config file
@@ -175,6 +199,16 @@ pub fn execute() -> Result<()> {
         ])?,
     }
 
+    if opts.no_progress {
+        let mut no_progress = NO_PROGRESS.lock().unwrap();
+        *no_progress = true;
+    }
+
+    if let Some(duration) = opts.progress_interval {
+        let mut interval = PROGRESS_INTERVAL.lock().unwrap();
+        *interval = *duration;
+    }
+
     if let Command::SelfUpdate(opts) = args.command {
         self_update::execute(opts)?;
         return Ok(());
@@ -193,7 +227,6 @@ pub fn execute() -> Result<()> {
 
     let mut repo_opts = args.repository;
     config_file.merge_into("repository", &mut repo_opts)?;
-    config_file.merge_into("global", &mut repo_opts)?; // deprecated, but repo-options were originally under [global]
     let repo = Repository::new(repo_opts)?;
 
     if let Command::Init(opts) = args.command {
@@ -212,11 +245,13 @@ pub fn execute() -> Result<()> {
         Command::Completions(_) => {} // already handled above
         Command::Copy(opts) => copy::execute(repo, opts, config_file)?,
         Command::Diff(opts) => diff::execute(repo, opts, config_file)?,
+        Command::Dump(opts) => dump::execute(repo, opts, config_file)?,
         Command::Forget(opts) => forget::execute(repo, opts, config_file)?,
         Command::Init(_) => {} // already handled above
         Command::Key(opts) => key::execute(repo, opts)?,
         Command::List(opts) => list::execute(repo, opts)?,
         Command::Ls(opts) => ls::execute(repo, opts, config_file)?,
+        Command::Merge(opts) => merge_cmd::execute(repo, opts, config_file, command)?,
         Command::SelfUpdate(_) => {} // already handled above
         Command::Snapshots(opts) => snapshots::execute(repo, opts, config_file)?,
         Command::Prune(opts) => prune::execute(repo, opts, vec![])?,

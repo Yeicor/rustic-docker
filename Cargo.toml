@@ -1,6 +1,6 @@
 [package]
 name = "rustic-rs"
-version = "0.4.4"
+version = "0.5.0"
 description = """
 fast, encrypted, deduplicated backups powered by pure Rust
 """
@@ -37,15 +37,15 @@ rayon = "1"
 aes256ctr_poly1305aes = "0.1"
 sha2 = "0.10"
 rand = "0.8"
-scrypt = { version = "0.10", default-features = false }
+scrypt = { version = "0.11", default-features = false }
 # chunker / packer
 # cdc = "0.1"
 integer-sqrt = "0.1"
 # serialization
-base64 = "0.20"
 binrw = "0.11"
 hex = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+serde_with = { version = "2.3", features = ["base64"] }
 serde_json = "1"
 serde-aux = "4"
 # other dependencies
@@ -67,29 +67,33 @@ backoff = "0.4"
 # rclone backend
 semver = "1"
 # cache
-dirs = "4"
+dirs = "5"
 cachedir = "0.3"
 # commands
 clap = { version = "3", features = ["derive", "env"] }
 clap_complete = "3.2.4"
-directories = "4"
+directories = "5"
 nom = "7"
 toml = "0.7"
 merge = "0.1"
-serde_with = "2.2"
 rpassword = "7"
 bytesize = "1"
 indicatif = "0.17" 
 path-dedot = "3"
+dunce = "1"
 gethostname = "0.4"
 humantime = "2"
-users = "0.11"
 itertools = "0.10"
 simplelog = "0.12"
 comfy-table = "6.1.4"
-libc="0.2"
+libc = "0.2"
+rhai = {version = "1.13", features = ["sync", "serde", "no_optimize", "no_module", "no_custom_syntax", "only_i64"]}
+
+[target.'cfg(not(windows))'.dependencies]
+users = "0.11"
+xattr = "1"
 
 [dev-dependencies]
-rstest = "0.16"
+rstest = "0.17"
 quickcheck = "1"
 quickcheck_macros = "1"
