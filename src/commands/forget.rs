@@ -112,10 +112,10 @@ pub(super) fn execute(
                     ("remove", "id argument".to_string())
                 } else {
                     match group_keep.matches(sn, last, iter.peek().is_some(), latest_time) {
-                        None if default_keep => ("keep", "".to_string()),
+                        None if default_keep => ("keep", String::new()),
                         None => {
                             forget_snaps.push(sn.id);
-                            ("remove", "".to_string())
+                            ("remove", String::new())
                         }
                         Some(reason) => ("keep", reason),
                     }
@@ -332,10 +332,11 @@ impl KeepOptions {
         let mut keep = false;
         let mut reason = Vec::new();
 
+        let snapshot_id_hex = sn.id.to_hex();
         if self
             .keep_ids
             .iter()
-            .any(|id| sn.id.to_hex().starts_with(id))
+            .any(|id| snapshot_id_hex.starts_with(id))
         {
             keep = true;
             reason.push("id");

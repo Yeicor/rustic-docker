@@ -29,7 +29,7 @@ use node::Node;
 pub use rclone::*;
 pub use rest::*;
 
-/// All FileTypes which are located in separated directories
+/// All [`FileType`]s which are located in separated directories
 pub const ALL_FILE_TYPES: [FileType; 4] = [
     FileType::Key,
     FileType::Snapshot,
@@ -47,8 +47,8 @@ pub enum FileType {
 }
 
 impl FileType {
-    pub fn name(&self) -> &str {
-        match &self {
+    pub fn name(self) -> &'static str {
+        match self {
             FileType::Config => "config",
             FileType::Snapshot => "snapshots",
             FileType::Index => "index",
@@ -57,7 +57,7 @@ impl FileType {
         }
     }
 
-    pub fn is_cacheable(&self) -> bool {
+    pub fn is_cacheable(self) -> bool {
         match self {
             FileType::Config | FileType::Key | FileType::Pack => false,
             FileType::Snapshot | FileType::Index => true,
@@ -103,8 +103,9 @@ pub trait ReadBackend: Clone + Send + Sync + 'static {
         }
         let mut results = vec![MapResult::None; vec.len()];
         for id in self.list(tpe)? {
+            let id_hex = id.to_hex();
             for (i, v) in vec.iter().enumerate() {
-                if id.to_hex().starts_with(v) {
+                if id_hex.starts_with(v) {
                     if results[i] == MapResult::None {
                         results[i] = MapResult::Some(id);
                     } else {

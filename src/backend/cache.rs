@@ -146,7 +146,7 @@ impl Cache {
 
     fn path(&self, tpe: FileType, id: &Id) -> PathBuf {
         let hex_id = id.to_hex();
-        self.path.join(tpe.name()).join(&hex_id[0..2]).join(&hex_id)
+        self.path.join(tpe.name()).join(&hex_id[0..2]).join(hex_id)
     }
 
     pub fn list_with_size(&self, tpe: FileType) -> Result<HashMap<Id, u32>> {
@@ -211,7 +211,7 @@ impl Cache {
             &offset
         );
         let mut file = File::open(self.path(tpe, id))?;
-        file.seek(SeekFrom::Start(offset as u64))?;
+        file.seek(SeekFrom::Start(u64::from(offset)))?;
         let mut vec = vec![0; length as usize];
         file.read_exact(&mut vec)?;
         trace!("cache hit!");

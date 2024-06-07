@@ -1,7 +1,8 @@
 use std::num::NonZeroU32;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use binrw::{io::Cursor, BinRead, BinWrite};
+use log::*;
 
 use crate::backend::FileType;
 use crate::id::Id;
@@ -87,18 +88,8 @@ impl HeaderEntry {
     // the length of this header entry
     fn length(&self) -> u32 {
         match &self {
-            Self::Data { len: _, id: _ } => Self::ENTRY_LEN,
-            Self::Tree { len: _, id: _ } => Self::ENTRY_LEN,
-            Self::CompData {
-                len: _,
-                len_data: _,
-                id: _,
-            } => Self::ENTRY_LEN_COMPRESSED,
-            Self::CompTree {
-                len: _,
-                len_data: _,
-                id: _,
-            } => Self::ENTRY_LEN_COMPRESSED,
+            Self::Data { .. } | Self::Tree { .. } => Self::ENTRY_LEN,
+            Self::CompData { .. } | Self::CompTree { .. } => Self::ENTRY_LEN_COMPRESSED,
         }
     }
 
@@ -175,6 +166,11 @@ impl PackHeader {
         // get header length from the file
         let size_real =
             PackHeaderLength::from_binary(&data.split_off(size_guess as usize))?.to_u32();
+        trace!("header size: {size_real}");
+
+        if size_real + LENGTH_LEN > pack_size {
+            bail!("Read header length is too large! Length: {size_real}, file size: {pack_size}");
+        }
 
         // now read the header
         let data = if size_real <= size_guess {
@@ -186,11 +182,31 @@ impl PackHeader {
             be.read_partial(FileType::Pack, &id, false, offset, size_real)?
         };
 
-        Self::from_binary(&be.decrypt(&data)?)
+        let header = Self::from_binary(&be.decrypt(&data)?)?;
+
+        if header.size() != size_real {
+            bail!("Read header length doesn't match header contents! Length: {size_real}, computed: {}", header.size());
+        }
+
+        if header.pack_size() != pack_size {
+            bail!("pack size computed from header doesn't match real pack isch! Computed: {}, real: {pack_size}", header.pack_size());
+        }
+
+        Ok(header)
     }
 
     pub fn into_blobs(self) -> Vec<IndexBlob> {
         self.0
+    }
+
+    // calculate the pack header size from the contained blobs
+    pub fn size(&self) -> u32 {
+        PackHeaderRef(&self.0).size()
+    }
+
+    // calculate the pack size from the contained blobs
+    pub fn pack_size(&self) -> u32 {
+        PackHeaderRef(&self.0).pack_size()
     }
 }
 
