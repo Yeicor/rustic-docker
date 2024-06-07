@@ -28,12 +28,14 @@ jobs:
           repository: 'rustic-rs/rustic'
           fetch-depth: 0
       - run: |
-          find $(dirname ${GITHUB_WORKSPACE})
+          # find $(dirname ${GITHUB_WORKSPACE})
           mv ${GITHUB_WORKSPACE} ${GITHUB_WORKSPACE}_original
           mkdir ${GITHUB_WORKSPACE}
-          echo "==========="
-          find $(dirname ${GITHUB_WORKSPACE})
+          # echo "==========="
+          # find $(dirname ${GITHUB_WORKSPACE})
       - uses: actions/checkout@v4   # Checkout self (to keep our custom files)
+        with:
+          fetch-depth: 0
       - id: push-all
         run: |
           updated_refs="["
@@ -49,7 +51,7 @@ jobs:
             fi
             find ${GITHUB_WORKSPACE}/ -type f -not \( -path "${GITHUB_WORKSPACE}/.git/*" -or -path "${GITHUB_WORKSPACE}/.github/*" \) -delete
             find ${GITHUB_WORKSPACE}/ -type d -empty -delete
-            find ${GITHUB_WORKSPACE}/
+            # find ${GITHUB_WORKSPACE}/
 
             # Copy all files from the original repository
             cd ${GITHUB_WORKSPACE}_original/
@@ -67,7 +69,7 @@ jobs:
             git config --global user.email 'Yeicor@users.noreply.github.com'
             git add -v .
             # FIXME: Detect no changes for tags...
-            if [[ `git status --porcelain` ]]; then # Changes
+            if [[ `git status --porcelain >/dev/null` ]]; then # Changes
               git commit -am "Automated sync of original sources"
               if [[ "$bt_is_tag" == "true" ]]; then
                 git tag -f "$bt"
@@ -82,7 +84,7 @@ jobs:
               echo "No changes detected..."
             fi
           done
-          updated_refs="${updated_refs%,}]"
+          updated_refs="${updated_refs%,},\"main\"]"
           echo "updatedrefs=$updated_refs" >> $GITHUB_OUTPUT
 
   trigger-docker-for-updates:
