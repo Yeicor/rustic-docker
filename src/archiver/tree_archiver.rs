@@ -115,7 +115,7 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> TreeArchiver<BE, I> {
                 self.summary.dirs_new += 1;
             }
             _ => {
-                // "Matched" trees where the subree id does not match or unmached trees
+                // "Matched" trees where the subtree id does not match or unmatched trees
                 debug!("changed   tree: {:?} {}", path, dirsize_bytes);
                 self.summary.dirs_changed += 1;
             }
@@ -127,8 +127,12 @@ impl<BE: DecryptWriteBackend, I: IndexedBackend> TreeArchiver<BE, I> {
         Ok(id)
     }
 
-    pub fn finalize(mut self) -> Result<(Id, SnapshotSummary)> {
-        let id = self.backup_tree(&PathBuf::new(), ParentResult::NotMatched)?;
+    pub fn finalize(mut self, parent_tree: Option<Id>) -> Result<(Id, SnapshotSummary)> {
+        let parent = match parent_tree {
+            None => ParentResult::NotMatched,
+            Some(id) => ParentResult::Matched(id),
+        };
+        let id = self.backup_tree(&PathBuf::new(), parent)?;
         let stats = self.tree_packer.finalize()?;
         stats.apply(&mut self.summary, BlobType::Tree);
 

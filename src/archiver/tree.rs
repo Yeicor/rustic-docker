@@ -3,10 +3,10 @@ use std::path::PathBuf;
 
 use crate::blob::{comp_to_osstr, Metadata, Node, NodeType};
 
-/// `TreeIterator` truns an Iterator yielding items with paths and Nodes into an
+/// `TreeIterator` turns an Iterator yielding items with paths and Nodes into an
 /// Iterator which ensures that all subdirectories are visited and closed.
 /// The resulting Iterator yielss a `TreeType` which either contains the original
-/// item, a new tree to be inserted or a pseudo item which idicates that a tree is finished.
+/// item, a new tree to be inserted or a pseudo item which indicates that a tree is finished.
 pub struct TreeIterator<T, I> {
     iter: I,
     path: PathBuf,
@@ -45,7 +45,14 @@ where
                 if self.path.pop() {
                     Some(TreeType::EndTree)
                 } else {
-                    None
+                    // Check if we still have a path prefix open...
+                    match self.path.components().next() {
+                        Some(std::path::Component::Prefix(..)) => {
+                            self.path = PathBuf::new();
+                            Some(TreeType::EndTree)
+                        }
+                        _ => None,
+                    }
                 }
             }
             Some((path, node, _)) => {

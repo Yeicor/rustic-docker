@@ -11,7 +11,7 @@ use serde::Deserialize;
 use toml::Value;
 
 use super::{bytes, progress_bytes, progress_counter, RusticConfig};
-use crate::archiver::{Archiver, Parent};
+use crate::archiver::Archiver;
 use crate::backend::{DryRunBackend, LocalSource, LocalSourceOptions, StdinSource};
 use crate::index::IndexBackend;
 use crate::repofile::{
@@ -206,14 +206,21 @@ pub(super) fn execute(
             }
         };
 
-        let parent = Parent::new(&index, parent_tree, opts.ignore_ctime, opts.ignore_inode);
-
-        let archiver = Archiver::new(be, index, &repo.config, parent, snap)?;
+        let archiver = Archiver::new(
+            be,
+            index,
+            &repo.config,
+            parent_tree,
+            opts.ignore_ctime,
+            opts.ignore_inode,
+            snap,
+        )?;
         let p = progress_bytes("determining size...");
 
         let snap = if backup_stdin {
-            let src = StdinSource::new()?;
-            archiver.archive(src, &backup_path[0], as_path.as_ref(), &p)?
+            let path = &backup_path[0];
+            let src = StdinSource::new(path.clone())?;
+            archiver.archive(src, path, as_path.as_ref(), &p)?
         } else {
             let src = LocalSource::new(opts.ignore_opts.clone(), &backup_path)?;
             archiver.archive(src, &backup_path[0], as_path.as_ref(), &p)?

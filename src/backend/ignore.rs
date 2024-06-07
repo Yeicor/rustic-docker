@@ -17,7 +17,7 @@ use serde_with::{serde_as, DisplayFromStr};
 #[cfg(not(windows))]
 use users::{Groups, Users, UsersCache};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "openbsd")))]
 use super::node::ExtendedAttribute;
 use super::node::{Metadata, NodeType};
 use super::{Node, ReadSource, ReadSourceEntry, ReadSourceOpen};
@@ -46,7 +46,7 @@ pub struct LocalSourceOptions {
     ignore_devid: bool,
 
     /// Glob pattern to exclude/include (can be specified multiple times)
-    #[clap(long, short = 'g', help_heading = "EXCLUDE OPTIONS")]
+    #[clap(long, help_heading = "EXCLUDE OPTIONS")]
     #[merge(strategy = merge::vec::overwrite_empty)]
     glob: Vec<String>,
 
@@ -325,15 +325,21 @@ fn map_entry(
     let device_id = if ignore_devid { 0 } else { m.dev() };
     let links = if m.is_dir() { 0 } else { m.nlink() };
 
-    let path = entry.path();
-    let extended_attributes = xattr::list(path)?
-        .map(|name| {
-            Ok(ExtendedAttribute {
-                name: name.to_string_lossy().to_string(),
-                value: xattr::get(path, name)?.unwrap(),
+    #[cfg(target_os = "openbsd")]
+    let extended_attributes = vec![];
+
+    #[cfg(not(target_os = "openbsd"))]
+    let extended_attributes = {
+        let path = entry.path();
+        xattr::list(path)?
+            .map(|name| {
+                Ok(ExtendedAttribute {
+                    name: name.to_string_lossy().to_string(),
+                    value: xattr::get(path, name)?.unwrap(),
+                })
             })
-        })
-        .collect::<Result<_>>()?;
+            .collect::<Result<_>>()?
+    };
 
     let meta = Metadata {
         size,
