@@ -91,14 +91,15 @@ jobs:
 
   trigger-docker-for-updates:
     needs: [ mirror ]
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
+    if: ${{ needs.mirror.outputs.updatedrefs != '[]' }}
     strategy:
       fail-fast: false  # TODO: Ignore errors for tags, not for main?
       matrix:
         ref: ${{fromJSON(needs.mirror.outputs.updatedrefs)}}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     uses: ./.github/workflows/docker-publish.yml
     with:
       ref: ${{ matrix.ref }}
