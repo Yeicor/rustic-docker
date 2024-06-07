@@ -7,7 +7,9 @@ use clap::Parser;
 use derivative::Derivative;
 use futures::{future, TryStreamExt};
 use indicatif::ProgressBar;
+use merge::Merge;
 use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DisplayFromStr};
 use vlog::*;
 
 use super::Id;
@@ -15,7 +17,7 @@ use crate::backend::{DecryptReadBackend, FileType, RepoFile};
 
 /// This is an extended version of the summaryOutput structure of restic in
 /// restic/internal/ui/backup$/json.go
-#[derive(Debug, Serialize, Deserialize, Derivative)]
+#[derive(Debug, Clone, Serialize, Deserialize, Derivative)]
 #[derivative(Default)]
 pub struct SnapshotSummary {
     pub files_new: u64,
@@ -61,7 +63,7 @@ impl DeleteOption {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Derivative)]
+#[derive(Debug, Clone, Serialize, Deserialize, Derivative)]
 #[derivative(Default)]
 pub struct SnapshotFile {
     #[derivative(Default(value = "Local::now()"))]
@@ -88,7 +90,7 @@ pub struct SnapshotFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<SnapshotSummary>,
 
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Id::is_null")]
     pub id: Id,
 }
 
@@ -244,9 +246,9 @@ impl SnapshotFile {
     }
 
     pub fn matches(&self, filter: &SnapshotFilter) -> bool {
-        self.paths.matches(&filter.paths)
-            && self.tags.matches(&filter.tags)
-            && (filter.hostnames.is_empty() || filter.hostnames.contains(&self.hostname))
+        self.paths.matches(&filter.filter_paths)
+            && self.tags.matches(&filter.filter_tags)
+            && (filter.filter_host.is_empty() || filter.filter_host.contains(&self.hostname))
     }
 
     /// Add tag lists to snapshot. return wheter snapshot was changed
@@ -308,19 +310,26 @@ impl Ord for SnapshotFile {
     }
 }
 
-#[derive(Parser)]
+#[serde_as]
+#[derive(Default, Parser, Deserialize, Merge)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct SnapshotFilter {
     /// Path list to filter (can be specified multiple times)
-    #[clap(long = "filter-paths", value_name = "PATH[,PATH,..]")]
-    paths: Vec<StringList>,
+    #[clap(long, value_name = "PATH[,PATH,..]")]
+    #[serde_as(as = "Vec<DisplayFromStr>")]
+    #[merge(strategy=merge::vec::overwrite_empty)]
+    filter_paths: Vec<StringList>,
 
     /// Tag list to filter (can be specified multiple times)
-    #[clap(long = "filter-tags", value_name = "TAG[,TAG,..]")]
-    tags: Vec<StringList>,
+    #[clap(long, value_name = "TAG[,TAG,..]")]
+    #[serde_as(as = "Vec<DisplayFromStr>")]
+    #[merge(strategy=merge::vec::overwrite_empty)]
+    filter_tags: Vec<StringList>,
 
     /// Hostname to filter (can be specified multiple times)
-    #[clap(long = "filter-host", value_name = "HOSTNAME")]
-    hostnames: Vec<String>,
+    #[clap(long, value_name = "HOSTNAME")]
+    #[merge(strategy=merge::vec::overwrite_empty)]
+    filter_host: Vec<String>,
 }
 
 #[derive(Default)]
@@ -347,10 +356,13 @@ impl FromStr for SnapshotGroupCriterion {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize)]
 pub struct SnapshotGroup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     paths: Option<StringList>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tags: Option<StringList>,
 }
 

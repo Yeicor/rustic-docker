@@ -3,9 +3,13 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use bytesize::ByteSize;
 use chrono::{TimeZone, Utc};
 use clap::Parser;
 use ignore::{overrides::OverrideBuilder, DirEntry, Walk, WalkBuilder};
+use merge::Merge;
+use serde::Deserialize;
+use serde_with::{serde_as, DisplayFromStr};
 use users::{Groups, Users, UsersCache};
 
 use super::{node::Metadata, node::NodeType, Node, ReadSource};
@@ -17,39 +21,54 @@ pub struct LocalSource {
     cache: UsersCache,
 }
 
-#[derive(Parser)]
+#[serde_as]
+#[derive(Default, Clone, Parser, Deserialize, Merge)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct LocalSourceOptions {
     /// Save access time for files and directories
     #[clap(long)]
+    #[merge(strategy = merge::bool::overwrite_false)]
     with_atime: bool,
 
-    /// Exclude other file systems, don't cross filesystem boundaries and subvolumes
-    #[clap(long, short = 'x')]
-    one_file_system: bool,
-
-    /// Glob pattern to include/exclue (can be specified multiple times)
-    #[clap(long, short = 'g')]
+    /// Glob pattern to exclude/include (can be specified multiple times)
+    #[clap(long, short = 'g', help_heading = "EXCLUDE OPTIONS")]
+    #[merge(strategy = merge::vec::overwrite_empty)]
     glob: Vec<String>,
 
-    /// Read glob patterns to exclude/include from this file (can be specified multiple times)
-    #[clap(long, value_name = "FILE")]
-    glob_file: Vec<String>,
-
-    /// Exclude contents of directories containing this filename (can be specified multiple times)
-    #[clap(long, value_name = "FILE")]
-    exclude_if_present: Vec<String>,
-
-    /// Ignore files based on .gitignore files
-    #[clap(long)]
-    git_ignore: bool,
-
     /// Same as --glob pattern but ignores the casing of filenames
-    #[clap(long, value_name = "GLOB")]
+    #[clap(long, value_name = "GLOB", help_heading = "EXCLUDE OPTIONS")]
+    #[merge(strategy = merge::vec::overwrite_empty)]
     iglob: Vec<String>,
 
+    /// Read glob patterns to exclude/include from this file (can be specified multiple times)
+    #[clap(long, value_name = "FILE", help_heading = "EXCLUDE OPTIONS")]
+    #[merge(strategy = merge::vec::overwrite_empty)]
+    glob_file: Vec<String>,
+
     /// Same as --glob-file ignores the casing of filenames in patterns
-    #[clap(long, value_name = "FILE")]
+    #[clap(long, value_name = "FILE", help_heading = "EXCLUDE OPTIONS")]
+    #[merge(strategy = merge::vec::overwrite_empty)]
     iglob_file: Vec<String>,
+
+    /// Ignore files based on .gitignore files
+    #[clap(long, help_heading = "EXCLUDE OPTIONS")]
+    #[merge(strategy = merge::bool::overwrite_false)]
+    git_ignore: bool,
+
+    /// Exclude contents of directories containing this filename (can be specified multiple times)
+    #[clap(long, value_name = "FILE", help_heading = "EXCLUDE OPTIONS")]
+    #[merge(strategy = merge::vec::overwrite_empty)]
+    exclude_if_present: Vec<String>,
+
+    /// Exclude other file systems, don't cross filesystem boundaries and subvolumes
+    #[clap(long, short = 'x', help_heading = "EXCLUDE OPTIONS")]
+    #[merge(strategy = merge::bool::overwrite_false)]
+    one_file_system: bool,
+
+    /// Maximum size of files to be backuped. Larger files will be excluded.
+    #[clap(long, value_name = "SIZE", help_heading = "EXCLUDE OPTIONS")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    exclude_larger_than: Option<ByteSize>,
 }
 
 impl LocalSource {
@@ -91,6 +110,7 @@ impl LocalSource {
             .git_ignore(opts.git_ignore)
             .sort_by_file_path(Path::cmp)
             .same_file_system(opts.one_file_system)
+            .max_filesize(opts.exclude_larger_than.map(|s| s.as_u64()))
             .overrides(override_builder.build()?);
 
         if !opts.exclude_if_present.is_empty() {

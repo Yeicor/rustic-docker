@@ -14,9 +14,9 @@ and can therefore be used as a complete replacement for restic.
 Note that rustic currently is in an beta release and misses tests.
 It is not yet considered to be ready for use in a production environment.
 
-## Are binaries availabe?
+## Are binaries available?
 Sure. Check out the [releases](https://github.com/rustic-rs/rustic/releases).
-Binaries for the latest development version are availably [here](https://github.com/rustic-rs/rustic-beta).
+Binaries for the latest development version are available [here](https://github.com/rustic-rs/rustic-beta).
 
 ## Have a question?
 
@@ -27,6 +27,7 @@ Look at the [FAQ][3] or open an issue!
 Improvements:
  * Allows using cold storage (e.g. AWS Glacier) repos which are only read in the `restore` command + supports warm-up
  * Completely lock-free pruning; option `instant-delete` is available
+ * Supports configuration in a config file ([example config files](https://github.com/rustic-rs/rustic/tree/main/examples))
  * Huge decrease in memory requirement
  * Pack size can be customized
  * Already faster than restic for most operations (but not yet fully speed optimized)
