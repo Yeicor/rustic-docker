@@ -1,104 +1,225 @@
-//! `restore` subcommand
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-use crate::{
-    commands::open_repository_indexed, helpers::bytes_size_to_string, status_err, Application,
-    RUSTIC_APP,
-};
+use anyhow::{anyhow, Result};
+use clap::Parser;
+use derive_getters::Dissolve;
+use futures::{stream::FuturesUnordered, TryStreamExt};
+use tokio::spawn;
+use vlog::*;
+use zstd::decode_all;
 
-use abscissa_core::{Command, Runnable, Shutdown};
-use anyhow::Result;
-use log::info;
+use super::progress_counter;
+use crate::backend::{DecryptReadBackend, FileType, LocalBackend};
+use crate::blob::{Node, NodeStreamer, NodeType};
+use crate::id::Id;
+use crate::index::{IndexBackend, IndexedBackend};
+use crate::repo::SnapshotFile;
 
-use rustic_core::{LocalDestination, LsOptions, RestoreOptions};
+#[derive(Parser)]
+pub(super) struct Opts {
+    /// dry-run: don't restore, only show what would be done
+    #[clap(long, short = 'n')]
+    dry_run: bool,
 
-use crate::filtering::SnapshotFilter;
+    /// TODO: remove files/dirs destination which are not contained in snapshot
+    #[clap(long)]
+    delete: bool,
 
-/// `restore` subcommand
-#[allow(clippy::struct_excessive_bools)]
-#[derive(clap::Parser, Command, Debug)]
-pub(crate) struct RestoreCmd {
-    /// Snapshot/path to restore
-    #[clap(value_name = "SNAPSHOT[:PATH]")]
-    snap: String,
+    /// snapshot to restore
+    id: String,
 
-    /// Restore destination
-    #[clap(value_name = "DESTINATION")]
+    /// restore destination
     dest: String,
-
-    /// Restore options
-    #[clap(flatten)]
-    opts: RestoreOptions,
-
-    /// List options
-    #[clap(flatten)]
-    ls_opts: LsOptions,
-
-    /// Snapshot filter options (when using latest)
-    #[clap(
-        flatten,
-        next_help_heading = "Snapshot filter options (when using latest)"
-    )]
-    filter: SnapshotFilter,
 }
-impl Runnable for RestoreCmd {
-    fn run(&self) {
-        if let Err(err) = self.inner_run() {
-            status_err!("{}", err);
-            RUSTIC_APP.shutdown(Shutdown::Crash);
-        };
+
+pub(super) async fn execute(be: &(impl DecryptReadBackend + Unpin), opts: Opts) -> Result<()> {
+    let snap = SnapshotFile::from_str(be, &opts.id, |_| true, progress_counter()).await?;
+
+    let dest = LocalBackend::new(&opts.dest);
+    let index = IndexBackend::new(be, progress_counter()).await?;
+
+    v2!("1st tree walk: allocating dirs/files and collecting restore information...");
+    let file_infos = allocate_and_collect(&dest, index.clone(), snap.tree, &opts).await?;
+
+    v2!("restoring file contents...");
+    restore_contents(be, &dest, file_infos, &opts).await?;
+
+    v2!("2nd tree walk: setting metadata");
+    restore_metadata(&dest, index, snap.tree, &opts).await?;
+
+    v1!("done.");
+    Ok(())
+}
+
+/// allocate files, scan or remove existing files and collect restore information
+async fn allocate_and_collect(
+    dest: &LocalBackend,
+    index: impl IndexedBackend + Unpin,
+    tree: Id,
+    opts: &Opts,
+) -> Result<FileInfos> {
+    let mut file_infos = FileInfos::new();
+
+    let mut node_streamer = NodeStreamer::new(index.clone(), tree).await?;
+    while let Some((path, node)) = node_streamer.try_next().await? {
+        match node.node_type() {
+            NodeType::Dir => {
+                if !opts.dry_run {
+                    dest.create_dir(&path);
+                }
+            }
+            NodeType::File => {
+                // collect blobs needed for restoring
+                let size = file_infos.add_file(&node, path.clone(), &index)?;
+                // create the file
+                if !opts.dry_run {
+                    dest.create_file(&path, size);
+                }
+            }
+            _ => {} // nothing to do for symlink, device, etc.
+        }
     }
+
+    Ok(file_infos)
 }
 
-impl RestoreCmd {
-    fn inner_run(&self) -> Result<()> {
-        let config = RUSTIC_APP.config();
-        let dry_run = config.global.dry_run;
-        let repo = open_repository_indexed(&config.repository)?;
+/// restore_contents restores all files contents as described by file_infos
+/// using the ReadBackend be and writing them into the LocalBackend dest.
+async fn restore_contents(
+    be: &impl DecryptReadBackend,
+    dest: &LocalBackend,
+    file_infos: FileInfos,
+    opts: &Opts,
+) -> Result<()> {
+    let (filenames, restore_info) = file_infos.dissolve();
 
-        let node =
-            repo.node_from_snapshot_path(&self.snap, |sn| config.snapshot_filter.matches(sn))?;
+    v1!("processing blobs...");
+    let p = progress_counter();
+    p.set_length(restore_info.iter().map(|(_, blob)| blob.len() as u64).sum());
+    let stream = FuturesUnordered::new();
 
-        // for restore, always recurse into tree
-        let mut ls_opts = self.ls_opts.clone();
-        ls_opts.recursive = true;
-        let ls = repo.ls(&node, &ls_opts)?;
+    for (pack, blob) in restore_info {
+        for (bl, fls) in blob {
+            let p = p.clone();
+            let be = be.clone();
+            let dest = dest.clone();
+            let dry_run = opts.dry_run;
+            let name_dests: Vec<_> = fls
+                .iter()
+                .map(|fl| (filenames[fl.file_idx].clone(), fl.file_start))
+                .collect();
 
-        let dest = LocalDestination::new(&self.dest, true, !node.is_dir())?;
+            // TODO: error handling!
+            stream.push(spawn(async move {
+                // read pack at blob_offset with length blob_length
+                let data = be
+                    .read_encrypted_partial(FileType::Pack, &pack, bl.offset, bl.length)
+                    .await
+                    .unwrap();
 
-        let restore_infos = repo.prepare_restore(&self.opts, ls.clone(), &dest, dry_run)?;
+                let data = match bl.compressed {
+                    false => data,
+                    true => decode_all(&*data).unwrap(),
+                };
 
-        let fs = restore_infos.stats.files;
-        println!(
-            "Files:  {} to restore, {} unchanged, {} verified, {} to modify, {} additional",
-            fs.restore, fs.unchanged, fs.verified, fs.modify, fs.additional
-        );
-        let ds = restore_infos.stats.dirs;
-        println!(
-            "Dirs:   {} to restore, {} to modify, {} additional",
-            ds.restore, ds.modify, ds.additional
-        );
-
-        info!(
-            "total restore size: {}",
-            bytes_size_to_string(restore_infos.restore_size)
-        );
-        if restore_infos.matched_size > 0 {
-            info!(
-                "using {} of existing file contents.",
-                bytes_size_to_string(restore_infos.matched_size)
-            );
+                if !dry_run {
+                    // save into needed files in parallel
+                    for (name, start) in name_dests {
+                        dest.write_at(&name, start, &data);
+                    }
+                }
+                p.inc(1);
+            }))
         }
-        if restore_infos.restore_size == 0 {
-            info!("all file contents are fine.");
-        }
+    }
 
-        if dry_run {
-            repo.warm_up(restore_infos.to_packs().into_iter())?;
-        } else {
-            repo.restore(restore_infos, &self.opts, ls, &dest)?;
-            println!("restore done.");
-        }
+    stream.try_collect().await?;
+    p.finish();
 
-        Ok(())
+    Ok(())
+}
+
+async fn restore_metadata(
+    dest: &LocalBackend,
+    index: impl IndexedBackend + Unpin,
+    tree: Id,
+    opts: &Opts,
+) -> Result<()> {
+    // walk over tree in repository and compare with tree in dest
+    let mut node_streamer = NodeStreamer::new(index, tree).await?;
+    while let Some((path, node)) = node_streamer.try_next().await? {
+        if !opts.dry_run {
+            if let NodeType::Symlink { linktarget } = node.node_type() {
+                dest.create_symlink(&path, linktarget);
+            }
+            dest.set_metadata(&path, node.meta());
+        }
+    }
+
+    Ok(())
+}
+/// struct that contains information of file contents grouped by
+/// 1) pack ID,
+/// 2) blob within this pack
+/// 3) the actual files and position of this blob within those
+#[derive(Debug, Dissolve)]
+struct FileInfos {
+    names: Filenames,
+    r: RestoreInfo,
+}
+
+type RestoreInfo = HashMap<Id, HashMap<BlobLocation, Vec<FileLocation>>>;
+type Filenames = Vec<PathBuf>;
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct BlobLocation {
+    offset: u32,
+    length: u32,
+    compressed: bool,
+}
+
+#[derive(Debug)]
+struct FileLocation {
+    file_idx: usize,
+    file_start: u64,
+}
+
+impl FileInfos {
+    fn new() -> Self {
+        Self {
+            names: Vec::new(),
+            r: HashMap::new(),
+        }
+    }
+
+    /// Add the file to FilesInfos using index to get blob information.
+    /// Returns the computed length of the file
+    fn add_file(&mut self, file: &Node, name: PathBuf, index: &impl IndexedBackend) -> Result<u64> {
+        let mut file_pos = 0;
+        if !file.content().is_empty() {
+            let file_idx = self.names.len();
+            self.names.push(name);
+            for id in file.content().iter() {
+                let ie = index
+                    .get_data(id)
+                    .ok_or_else(|| anyhow!("did not find id {} in index", id))?;
+                let bl = BlobLocation {
+                    offset: *ie.offset(),
+                    length: *ie.length(),
+                    compressed: ie.uncompressed_length().is_some(),
+                };
+
+                let pack = self.r.entry(*ie.pack()).or_insert_with(HashMap::new);
+                let blob_location = pack.entry(bl).or_insert_with(Vec::new);
+                blob_location.push(FileLocation {
+                    file_idx,
+                    file_start: file_pos,
+                });
+
+                file_pos += ie.data_length() as u64;
+            }
+        }
+        Ok(file_pos)
     }
 }
