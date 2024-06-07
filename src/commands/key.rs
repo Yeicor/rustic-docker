@@ -1,92 +1,63 @@
-//! `key` subcommand
+use std::fs::File;
+use std::io::BufReader;
 
-use crate::{commands::open_repository, status_err, Application, RUSTIC_APP};
-
-use std::path::PathBuf;
-
-use abscissa_core::{Command, Runnable, Shutdown};
 use anyhow::Result;
-use dialoguer::Password;
-use log::info;
+use clap::{Parser, Subcommand};
+use rpassword::{prompt_password, read_password_from_bufread};
 
-use rustic_core::{KeyOptions, RepositoryOptions};
+use crate::backend::{FileType, WriteBackend};
+use crate::crypto::{hash, Key};
+use crate::repo::KeyFile;
 
-/// `key` subcommand
-#[derive(clap::Parser, Command, Debug)]
-pub(super) struct KeyCmd {
-    /// Subcommand to run
+#[derive(Parser)]
+pub(super) struct Opts {
     #[clap(subcommand)]
-    cmd: KeySubCmd,
+    command: Command,
 }
 
-#[derive(clap::Subcommand, Debug, Runnable)]
-enum KeySubCmd {
-    /// Add a new key to the repository
-    Add(AddCmd),
+#[derive(Subcommand)]
+enum Command {
+    Add(AddOpts),
 }
 
-#[derive(clap::Parser, Debug)]
-pub(crate) struct AddCmd {
-    /// New password
+#[derive(Parser)]
+pub(crate) struct AddOpts {
+    /// set 'hostname' in public key information
     #[clap(long)]
-    pub(crate) new_password: Option<String>,
+    pub(crate) hostname: Option<String>,
 
-    /// File from which to read the new password
+    /// set 'username' in public key information
     #[clap(long)]
-    pub(crate) new_password_file: Option<PathBuf>,
+    pub(crate) username: Option<String>,
 
-    /// Command to get the new password from
+    /// add 'created' date in public key information
     #[clap(long)]
-    pub(crate) new_password_command: Vec<String>,
+    pub(crate) with_created: bool,
 
-    /// Key options
-    #[clap(flatten)]
-    pub(crate) key_opts: KeyOptions,
+    /// file from which to read the new password
+    #[clap(long)]
+    pub(crate) new_password_file: Option<String>,
 }
 
-impl Runnable for KeyCmd {
-    fn run(&self) {
-        self.cmd.run();
+pub(super) async fn execute(be: &impl WriteBackend, key: Key, opts: Opts) -> Result<()> {
+    match opts.command {
+        Command::Add(opt) => add_key(be, key, opt).await,
     }
 }
 
-impl Runnable for AddCmd {
-    fn run(&self) {
-        if let Err(err) = self.inner_run() {
-            status_err!("{}", err);
-            RUSTIC_APP.shutdown(Shutdown::Crash);
-        };
-    }
-}
+async fn add_key(be: &impl WriteBackend, key: Key, opts: AddOpts) -> Result<()> {
+    let pass = match opts.new_password_file {
+        Some(file) => {
+            let mut file = BufReader::new(File::open(file)?);
+            read_password_from_bufread(&mut file)?
+        }
+        None => prompt_password("enter password for new key: ")?,
+    };
+    let keyfile = KeyFile::generate(key, &pass, opts.hostname, opts.username, opts.with_created)?;
+    let data = serde_json::to_vec(&keyfile)?;
+    let id = hash(&data);
+    be.write_bytes(FileType::Key, &id, data).await?;
 
-impl AddCmd {
-    fn inner_run(&self) -> Result<()> {
-        let config = RUSTIC_APP.config();
-        let repo = open_repository(&config.repository)?;
-
-        // create new Repository options which just contain password information
-        let pass_opts = RepositoryOptions {
-            password: self.new_password.clone(),
-            password_file: self.new_password_file.clone(),
-            password_command: self.new_password_command.clone(),
-            ..Default::default()
-        };
-
-        let pass = pass_opts
-            .evaluate_password()
-            .map_err(|err| err.into())
-            .transpose()
-            .unwrap_or_else(|| -> Result<_> {
-                Ok(Password::new()
-                    .with_prompt("enter password for new key")
-                    .allow_empty_password(true)
-                    .with_confirmation("confirm password", "passwords do not match")
-                    .interact()?)
-            })?;
-
-        let id = repo.add_key(&pass, &self.key_opts)?;
-        info!("key {id} successfully added.");
-
-        Ok(())
-    }
+    println!("key {} successfully added.", id);
+    Ok(())
 }

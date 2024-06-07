@@ -1,271 +1,187 @@
-//! `backup` subcommand
-
 use std::path::PathBuf;
 
-use crate::{
-    commands::{get_repository, init::init, open_repository},
-    helpers::bytes_size_to_string,
-    status_err, Application, RUSTIC_APP,
+use anyhow::{anyhow, bail, Result};
+use chrono::{Duration, Local};
+use clap::Parser;
+use gethostname::gethostname;
+use path_absolutize::*;
+use vlog::*;
+
+use super::{bytes, progress_bytes, progress_counter};
+use crate::archiver::{Archiver, Parent};
+use crate::backend::{
+    DecryptFullBackend, DecryptWriteBackend, DryRunBackend, LocalSource, LocalSourceOptions,
+    ReadSource,
 };
+use crate::id::Id;
+use crate::index::IndexBackend;
+use crate::repo::{ConfigFile, DeleteOption, SnapshotFile, SnapshotSummary, StringList};
 
-use abscissa_core::{Command, Runnable, Shutdown};
-use anyhow::{bail, Context, Result};
-use log::{debug, info, warn};
-use merge::Merge;
-use serde::{Deserialize, Serialize};
-use serde_with::{serde_as, OneOrMany};
+#[derive(Parser)]
+pub(super) struct Opts {
+    /// Do not upload or write any data, just show what would be done
+    #[clap(long, short = 'n')]
+    dry_run: bool,
 
-use rustic_core::{
-    BackupOptions, ConfigOptions, KeyOptions, LocalSourceFilterOptions, LocalSourceSaveOptions,
-    ParentOptions, PathList, SnapshotOptions,
-};
+    /// Snapshot to use as parent
+    #[clap(long, value_name = "SNAPSHOT", conflicts_with = "force")]
+    parent: Option<String>,
 
-/// `backup` subcommand
-#[serde_as]
-#[derive(Clone, Command, Default, Debug, clap::Parser, Serialize, Deserialize, Merge)]
-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-// Note: using cli_sources, sources and source within this struct is a hack to support serde(deny_unknown_fields)
-// for deserializing the backup options from TOML
-// Unfortunately we cannot work with nested flattened structures, see
-// https://github.com/serde-rs/serde/issues/1547
-// A drawback is that a wrongly set "source(s) = ..." won't get correct error handling and need to be manually checked, see below.
-#[allow(clippy::struct_excessive_bools)]
-pub struct BackupCmd {
-    /// Backup source (can be specified multiple times), use - for stdin. If no source is given, uses all
-    /// sources defined in the config file
-    #[clap(value_name = "SOURCE")]
-    #[merge(skip)]
-    #[serde(skip)]
-    cli_sources: Vec<String>,
+    /// Use no parent, read all files
+    #[clap(long, short, conflicts_with = "parent")]
+    force: bool,
 
-    /// Set filename to be used when backing up from stdin
-    #[clap(long, value_name = "FILENAME", default_value = "stdin")]
-    #[merge(skip)]
-    stdin_filename: String,
+    /// Tags to add to backup (can be specified multiple times)
+    #[clap(long, value_name = "TAG[,TAG,..]")]
+    tag: Vec<StringList>,
 
-    /// Manually set backup path in snapshot
-    #[clap(long, value_name = "PATH")]
-    as_path: Option<PathBuf>,
+    /// Mark snapshot as uneraseable
+    #[clap(long, conflicts_with = "delete-after")]
+    delete_never: bool,
 
-    /// Ignore save options
+    /// Mark snapshot to be deleted after given duration (e.g. 10d)
+    #[clap(long, value_name = "DURATION")]
+    delete_after: Option<humantime::Duration>,
+
     #[clap(flatten)]
-    #[serde(flatten)]
-    ignore_save_opts: LocalSourceSaveOptions,
+    ignore_opts: LocalSourceOptions,
 
-    /// Don't scan the backup source for its size - this disables ETA estimation for backup.
-    #[clap(long)]
-    #[merge(strategy = merge::bool::overwrite_false)]
-    pub no_scan: bool,
-
-    /// Output generated snapshot in json format
-    #[clap(long)]
-    #[merge(strategy = merge::bool::overwrite_false)]
-    json: bool,
-
-    /// Don't show any output
-    #[clap(long, conflicts_with = "json")]
-    #[merge(strategy = merge::bool::overwrite_false)]
-    quiet: bool,
-
-    /// Initialize repository, if it doesn't exist yet
-    #[clap(long)]
-    #[merge(strategy = merge::bool::overwrite_false)]
-    init: bool,
-
-    /// Parent processing options
-    #[clap(flatten, next_help_heading = "Options for parent processing")]
-    #[serde(flatten)]
-    parent_opts: ParentOptions,
-
-    /// Exclude options
-    #[clap(flatten, next_help_heading = "Exclude options")]
-    #[serde(flatten)]
-    ignore_filter_opts: LocalSourceFilterOptions,
-
-    /// Snapshot options
-    #[clap(flatten, next_help_heading = "Snapshot options")]
-    #[serde(flatten)]
-    snap_opts: SnapshotOptions,
-
-    /// Key options (when using --init)
-    #[clap(flatten, next_help_heading = "Key options (when using --init)")]
-    #[serde(skip)]
-    #[merge(skip)]
-    key_opts: KeyOptions,
-
-    /// Config options (when using --init)
-    #[clap(flatten, next_help_heading = "Config options (when using --init)")]
-    #[serde(skip)]
-    #[merge(skip)]
-    config_opts: ConfigOptions,
-
-    /// Backup sources
-    #[clap(skip)]
-    #[merge(strategy = merge_sources)]
-    sources: Vec<BackupCmd>,
-
-    /// Backup source, used within config file
-    #[clap(skip)]
-    #[merge(skip)]
-    #[serde_as(as = "OneOrMany<_>")]
-    source: Vec<String>,
+    /// backup source
+    source: String,
 }
 
-/// Merge backup sources
-///
-/// If a source is already defined on left, use that. Else add it.
-///
-/// # Arguments
-///
-/// * `left` - Vector of backup sources
-pub(crate) fn merge_sources(left: &mut Vec<BackupCmd>, mut right: Vec<BackupCmd>) {
-    left.append(&mut right);
-    left.sort_by(|opt1, opt2| opt1.source.cmp(&opt2.source));
-    left.dedup_by(|opt1, opt2| opt1.source == opt2.source);
-}
+pub(super) async fn execute(
+    be: &impl DecryptFullBackend,
+    opts: Opts,
+    config_id: &Id,
+    command: String,
+) -> Result<()> {
+    let time = Local::now();
+    let config: ConfigFile = be.get_file(config_id).await?;
+    let poly = config.poly()?;
+    let zstd = match config.version {
+        1 => None,
+        2 => Some(0),
+        _ => bail!("config version not supported!"),
+    };
+    let mut be = DryRunBackend::new(be.clone(), opts.dry_run);
+    be.set_zstd(zstd);
 
-impl Runnable for BackupCmd {
-    fn run(&self) {
-        if let Err(err) = self.inner_run() {
-            status_err!("{}", err);
-            RUSTIC_APP.shutdown(Shutdown::Crash);
-        };
+    let backup_path = PathBuf::from(&opts.source);
+    let backup_path = backup_path.absolutize()?;
+    let backup_path_str = backup_path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-unicode path {:?}", backup_path))?
+        .to_string();
+
+    let hostname = gethostname();
+    let hostname = hostname
+        .to_str()
+        .ok_or_else(|| anyhow!("non-unicode hostname {:?}", hostname))?
+        .to_string();
+
+    let parent = match (opts.force, opts.parent) {
+        (true, _) => None,
+        (false, None) => SnapshotFile::latest(
+            &be,
+            |snap| snap.hostname == hostname && snap.paths.contains(&backup_path_str),
+            progress_counter(),
+        )
+        .await
+        .ok(),
+        (false, Some(parent)) => SnapshotFile::from_id(&be, &parent).await.ok(),
+    };
+
+    let parent_tree = match &parent {
+        Some(snap) => {
+            v1!("using parent {}", snap.id);
+            Some(snap.tree)
+        }
+        None => {
+            v1!("using no parent");
+            None
+        }
+    };
+
+    let delete = match (opts.delete_never, opts.delete_after) {
+        (true, _) => DeleteOption::Never,
+        (_, Some(d)) => DeleteOption::After(time + Duration::from_std(*d)?),
+        (false, None) => DeleteOption::NotSet,
+    };
+
+    let mut snap = SnapshotFile {
+        time,
+        parent: parent.map(|sn| sn.id),
+        hostname,
+        delete,
+        summary: Some(SnapshotSummary {
+            command,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    snap.paths.add(backup_path_str.clone());
+    snap.set_tags(opts.tag);
+
+    let index = IndexBackend::only_full_trees(&be, progress_counter()).await?;
+
+    let parent = Parent::new(&index, parent_tree).await;
+
+    let src = LocalSource::new(opts.ignore_opts, backup_path.to_path_buf())?;
+
+    let size = if get_verbosity_level() == 1 {
+        v1!("determining size of backup source...");
+        src.size()?
+    } else {
+        0
+    };
+
+    v1!("starting backup...");
+    let mut archiver = Archiver::new(be, index, poly, parent, snap, zstd)?;
+    let p = progress_bytes();
+    p.set_length(size);
+    for item in src {
+        match item {
+            Err(e) => {
+                eprintln!("ignoring error {}\n", e)
+            }
+            Ok((path, node)) => {
+                if let Err(e) = archiver.add_entry(&path, node, p.clone()).await {
+                    eprintln!("ignoring error {} for {:?}\n", e, path);
+                }
+            }
+        }
     }
-}
+    p.finish_with_message("done");
+    let snap = archiver.finalize_snapshot().await?;
+    let summary = snap.summary.unwrap();
 
-impl BackupCmd {
-    fn inner_run(&self) -> Result<()> {
-        let config = RUSTIC_APP.config();
-        let repo = get_repository(&config.repository)?;
-        // Initialize repository if --init is set and it is not yet initialized
-        let repo = if self.init && repo.config_id()?.is_none() {
-            if config.global.dry_run {
-                bail!(
-                    "cannot initialize repository {} in dry-run mode!",
-                    repo.name
-                );
-            }
-            init(repo, &self.key_opts, &self.config_opts)?
-        } else {
-            open_repository(&config.repository)?
-        }
-        .to_indexed_ids()?;
+    v1!(
+        "Files:       {} new, {} changed, {} unchanged",
+        summary.files_new,
+        summary.files_changed,
+        summary.files_unmodified
+    );
+    v1!(
+        "Dirs:        {} new, {} changed, {} unchanged",
+        summary.dirs_new,
+        summary.dirs_changed,
+        summary.dirs_unmodified
+    );
+    v2!("Data Blobs:  {} new", summary.data_blobs);
+    v2!("Tree Blobs:  {} new", summary.tree_blobs);
+    v1!(
+        "Added to the repo: {} (raw: {})",
+        bytes(summary.data_added_packed),
+        bytes(summary.data_added)
+    );
 
-        // manually check for a "source" field, check is not done by serde, see above.
-        if !config.backup.source.is_empty() {
-            bail!("key \"source\" is not valid in the [backup] section!");
-        }
+    v1!(
+        "processed {} files, {}",
+        summary.total_files_processed,
+        bytes(summary.total_bytes_processed)
+    );
+    v1!("snapshot {} successfully saved.", snap.id);
 
-        let config_opts = &config.backup.sources;
-
-        // manually check for a "sources" field, check is not done by serde, see above.
-        if config_opts.iter().any(|opt| !opt.sources.is_empty()) {
-            bail!("key \"sources\" is not valid in a [[backup.sources]] section!");
-        }
-
-        let config_sources: Vec<_> = config_opts
-            .iter()
-            .map(|opt| -> Result<_> {
-                Ok(PathList::from_iter(&opt.source)
-                    .sanitize()
-                    .with_context(|| {
-                        format!(
-                            "error sanitizing source=\"{:?}\" in config file",
-                            opt.source
-                        )
-                    })?
-                    .merge())
-            })
-            .filter_map(|p| match p {
-                Ok(paths) => Some(paths),
-                Err(err) => {
-                    warn!("{err}");
-                    None
-                }
-            })
-            .collect();
-
-        let sources = match (self.cli_sources.is_empty(), config_opts.is_empty()) {
-            (false, _) => {
-                let item = PathList::from_iter(&self.cli_sources).sanitize()?;
-                vec![item]
-            }
-            (true, false) => {
-                info!("using all backup sources from config file.");
-                config_sources.clone()
-            }
-            (true, true) => {
-                bail!("no backup source given.");
-            }
-        };
-
-        for source in sources {
-            let mut opts = self.clone();
-
-            // merge Options from config file, if given
-            if let Some(idx) = config_sources.iter().position(|s| s == &source) {
-                info!("merging source={source} section from config file");
-                opts.merge(config_opts[idx].clone());
-            }
-            if let Some(path) = &opts.as_path {
-                // as_path only works in combination with a single target
-                if source.len() > 1 {
-                    bail!("as-path only works with a single target!");
-                }
-                // merge Options from config file using as_path, if given
-                if let Some(path) = path.as_os_str().to_str() {
-                    if let Some(idx) = config_opts.iter().position(|opt| opt.source == vec![path]) {
-                        info!("merging source=\"{path}\" section from config file");
-                        opts.merge(config_opts[idx].clone());
-                    }
-                }
-            }
-
-            // merge "backup" section from config file, if given
-            opts.merge(config.backup.clone());
-
-            let backup_opts = BackupOptions::default()
-                .stdin_filename(opts.stdin_filename)
-                .as_path(opts.as_path)
-                .parent_opts(opts.parent_opts)
-                .ignore_save_opts(opts.ignore_save_opts)
-                .ignore_filter_opts(opts.ignore_filter_opts)
-                .no_scan(opts.no_scan)
-                .dry_run(config.global.dry_run);
-            let snap = repo.backup(&backup_opts, &source, opts.snap_opts.to_snapshot()?)?;
-
-            if opts.json {
-                let mut stdout = std::io::stdout();
-                serde_json::to_writer_pretty(&mut stdout, &snap)?;
-            } else if !opts.quiet {
-                let summary = snap.summary.unwrap();
-                println!(
-                    "Files:       {} new, {} changed, {} unchanged",
-                    summary.files_new, summary.files_changed, summary.files_unmodified
-                );
-                println!(
-                    "Dirs:        {} new, {} changed, {} unchanged",
-                    summary.dirs_new, summary.dirs_changed, summary.dirs_unmodified
-                );
-                debug!("Data Blobs:  {} new", summary.data_blobs);
-                debug!("Tree Blobs:  {} new", summary.tree_blobs);
-                println!(
-                    "Added to the repo: {} (raw: {})",
-                    bytes_size_to_string(summary.data_added_packed),
-                    bytes_size_to_string(summary.data_added)
-                );
-
-                println!(
-                    "processed {} files, {}",
-                    summary.total_files_processed,
-                    bytes_size_to_string(summary.total_bytes_processed)
-                );
-                println!("snapshot {} successfully saved.", snap.id);
-            }
-
-            info!("backup of {source} done.");
-        }
-
-        Ok(())
-    }
+    Ok(())
 }
