@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use bytesize::ByteSize;
 use chrono::{DateTime, Duration, Local};
 use clap::Parser;
-use futures::TryStreamExt;
+use futures::{future, TryStreamExt};
 use vlog::*;
 
 use super::{bytes, progress_counter};
@@ -40,18 +40,18 @@ pub(super) struct Opts {
 
     /// don't remove anything, only show what would be done
     #[clap(long, short = 'n')]
-    dry_run: bool,
+    pub(crate) dry_run: bool,
 }
 
 pub(super) async fn execute(
     be: &(impl DecryptFullBackend + Unpin),
     opts: Opts,
-    config_id: &Id,
+    config: ConfigFile,
+    ignore_snaps: Vec<Id>,
 ) -> Result<()> {
     v1!("reading index...");
     let mut index_files = Vec::new();
 
-    let config: ConfigFile = be.get_file(config_id).await?;
     let zstd = match config.version {
         1 => None,
         2 => Some(0),
@@ -76,7 +76,7 @@ pub(super) async fn execute(
 
     let used_ids = {
         let indexed_be = IndexBackend::new_from_index(&be, index_collector.into_index());
-        find_used_blobs(&indexed_be).await?
+        find_used_blobs(&indexed_be, ignore_snaps).await?
     };
 
     // list existing pack files
@@ -729,7 +729,13 @@ impl Pruner {
                                 continue;
                             }
                             let data = be
-                                .read_partial(FileType::Pack, &pack.id, blob.offset, blob.length)
+                                .read_partial(
+                                    FileType::Pack,
+                                    &pack.id,
+                                    blob.tpe.is_cacheable(),
+                                    blob.offset,
+                                    blob.length,
+                                )
                                 .await?;
                             match blob.tpe {
                                 BlobType::Data => &mut data_packer,
@@ -855,7 +861,11 @@ impl PackInfo {
 }
 
 // find used blobs in repo
-async fn find_used_blobs(index: &(impl IndexedBackend + Unpin)) -> Result<HashMap<Id, u8>> {
+async fn find_used_blobs(
+    index: &(impl IndexedBackend + Unpin),
+    ignore_snaps: Vec<Id>,
+) -> Result<HashMap<Id, u8>> {
+    let ignore_snaps: HashSet<_> = ignore_snaps.into_iter().collect();
     v1!("reading snapshots...");
 
     let p = progress_counter();
@@ -863,6 +873,9 @@ async fn find_used_blobs(index: &(impl IndexedBackend + Unpin)) -> Result<HashMa
         .be()
         .stream_all::<SnapshotFile>(p.clone())
         .await?
+        // TODO: it would even better to give ignore_snaps to the streaming function instead
+        // if reading and then filtering the snapshot
+        .try_filter(|(id, _)| future::ready(!ignore_snaps.contains(id)))
         .map_ok(|(_, snap)| snap.tree)
         .try_collect()
         .await?;

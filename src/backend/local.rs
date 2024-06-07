@@ -1,14 +1,19 @@
 use std::fs::{self, File};
 use std::io::{copy, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use async_trait::async_trait;
+use filetime::{set_file_atime, set_file_mtime, FileTime};
+use nix::sys::stat::{mknod, Mode, SFlag};
+use nix::unistd::chown;
+use nix::unistd::{Gid, Group, Uid, User};
 use vlog::*;
 use walkdir::WalkDir;
 
-use super::{node::Metadata, FileType, Id, ReadBackend, WriteBackend, ALL_FILE_TYPES};
+use super::node::{Metadata, Node, NodeType};
+use super::{map_mode_from_go, FileType, Id, ReadBackend, WriteBackend, ALL_FILE_TYPES};
 
 #[derive(Clone)]
 pub struct LocalBackend {
@@ -32,13 +37,11 @@ impl LocalBackend {
 
 #[async_trait]
 impl ReadBackend for LocalBackend {
-    type Error = std::io::Error;
-
     fn location(&self) -> &str {
         self.path.to_str().unwrap()
     }
 
-    async fn list(&self, tpe: FileType) -> Result<Vec<Id>, Self::Error> {
+    async fn list(&self, tpe: FileType) -> Result<Vec<Id>> {
         if tpe == FileType::Config {
             return Ok(match self.path.join("config").exists() {
                 true => vec![Id::default()],
@@ -55,7 +58,7 @@ impl ReadBackend for LocalBackend {
         Ok(walker.collect())
     }
 
-    async fn list_with_size(&self, tpe: FileType) -> Result<Vec<(Id, u32)>, Self::Error> {
+    async fn list_with_size(&self, tpe: FileType) -> Result<Vec<(Id, u32)>> {
         let path = self.path.join(tpe.name());
 
         if tpe == FileType::Config {
@@ -71,10 +74,22 @@ impl ReadBackend for LocalBackend {
         let walker = WalkDir::new(path)
             .into_iter()
             .filter_map(walkdir::Result::ok)
-            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                // only use files with length of 64 which are valid hex
+                // TODO: maybe add an option which warns if other files exist?
+                e.file_type().is_file()
+                    && e.file_name().len() == 64
+                    && e.file_name().is_ascii()
+                    && e.file_name()
+                        .to_str()
+                        .unwrap()
+                        .chars()
+                        .into_iter()
+                        .all(|c| ('0'..='9').contains(&c) || ('a'..='f').contains(&c))
+            })
             .map(|e| {
                 (
-                    Id::from_hex(&e.file_name().to_string_lossy()).unwrap(),
+                    Id::from_hex(e.file_name().to_str().unwrap()).unwrap(),
                     e.metadata().unwrap().len().try_into().unwrap(),
                 )
             });
@@ -82,17 +97,18 @@ impl ReadBackend for LocalBackend {
         Ok(walker.collect())
     }
 
-    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Vec<u8>, Self::Error> {
-        fs::read(self.path(tpe, id))
+    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Vec<u8>> {
+        Ok(fs::read(self.path(tpe, id))?)
     }
 
     async fn read_partial(
         &self,
         tpe: FileType,
         id: &Id,
+        _cacheable: bool,
         offset: u32,
         length: u32,
-    ) -> Result<Vec<u8>, Self::Error> {
+    ) -> Result<Vec<u8>> {
         let mut file = File::open(self.path(tpe, id))?;
         file.seek(SeekFrom::Start(offset.try_into().unwrap()))?;
         let mut vec = vec![0; length.try_into().unwrap()];
@@ -103,7 +119,7 @@ impl ReadBackend for LocalBackend {
 
 #[async_trait]
 impl WriteBackend for LocalBackend {
-    async fn create(&self) -> Result<(), Self::Error> {
+    async fn create(&self) -> Result<()> {
         for tpe in ALL_FILE_TYPES {
             fs::create_dir_all(self.path.join(tpe.name()))?;
         }
@@ -113,7 +129,13 @@ impl WriteBackend for LocalBackend {
         Ok(())
     }
 
-    async fn write_file(&self, tpe: FileType, id: &Id, mut f: File) -> Result<(), Self::Error> {
+    async fn write_file(
+        &self,
+        tpe: FileType,
+        id: &Id,
+        _cacheable: bool,
+        mut f: File,
+    ) -> Result<()> {
         v3!("writing tpe: {:?}, id: {}", &tpe, &id);
         let filename = self.path(tpe, id);
         let mut file = fs::OpenOptions::new()
@@ -121,10 +143,11 @@ impl WriteBackend for LocalBackend {
             .write(true)
             .open(&filename)?;
         copy(&mut f, &mut file)?;
-        file.sync_all()
+        file.sync_all()?;
+        Ok(())
     }
 
-    async fn write_bytes(&self, tpe: FileType, id: &Id, buf: Vec<u8>) -> Result<(), Self::Error> {
+    async fn write_bytes(&self, tpe: FileType, id: &Id, buf: Vec<u8>) -> Result<()> {
         v3!("writing tpe: {:?}, id: {}", &tpe, &id);
         let filename = self.path(tpe, id);
         let mut file = fs::OpenOptions::new()
@@ -132,13 +155,15 @@ impl WriteBackend for LocalBackend {
             .write(true)
             .open(&filename)?;
         file.write_all(&buf)?;
-        file.sync_all()
+        file.sync_all()?;
+        Ok(())
     }
 
-    async fn remove(&self, tpe: FileType, id: &Id) -> Result<(), Self::Error> {
+    async fn remove(&self, tpe: FileType, id: &Id) -> Result<()> {
         v3!("writing tpe: {:?}, id: {}", &tpe, &id);
         let filename = self.path(tpe, id);
-        fs::remove_file(filename)
+        fs::remove_file(filename)?;
+        Ok(())
     }
 }
 
@@ -169,26 +194,95 @@ impl LocalBackend {
         fs::create_dir(&dirname).unwrap();
     }
 
-    pub fn create_symlink(&self, item: impl AsRef<Path>, dest: impl AsRef<Path>) {
+    pub fn set_times(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
         let filename = self.path.join(item);
-        std::os::unix::fs::symlink(dest, filename).unwrap();
+        if let Some(mtime) = meta.mtime.map(|t| FileTime::from_system_time(t.into())) {
+            set_file_mtime(&filename, mtime)?;
+        }
+        if let Some(atime) = meta.atime.map(|t| FileTime::from_system_time(t.into())) {
+            set_file_atime(&filename, atime)?;
+        }
+        Ok(())
     }
 
-    // TODO: uid/gid and times
-    pub fn set_metadata(&self, item: impl AsRef<Path>, meta: &Metadata) {
-        let mode = *meta.mode();
-        if mode == 0 {
-            return;
-        }
+    pub fn set_user_group(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
         let filename = self.path.join(item);
-        std::fs::set_permissions(&filename, fs::Permissions::from_mode(mode))
-            .unwrap_or_else(|_| panic!("error chmod {:?}", filename));
+
+        let user = meta
+            .user
+            .as_ref()
+            .and_then(|name| User::from_name(name).unwrap());
+
+        // use uid from user if valid, else from saved uid (if saved)
+        let uid = user.map(|u| u.uid).or_else(|| meta.uid.map(Uid::from_raw));
+
+        let group = meta
+            .group
+            .as_ref()
+            .and_then(|name| Group::from_name(name).unwrap());
+        // use gid from group if valid, else from saved gid (if saved)
+        let gid = group.map(|g| g.gid).or_else(|| meta.gid.map(Gid::from_raw));
+
+        chown(&filename, uid, gid)?;
+        Ok(())
+    }
+
+    pub fn set_uid_gid(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
+        let filename = self.path.join(item);
+
+        let uid = meta.uid.map(Uid::from_raw);
+        let gid = meta.gid.map(Gid::from_raw);
+
+        chown(&filename, uid, gid)?;
+        Ok(())
+    }
+
+    pub fn set_permission(&self, item: impl AsRef<Path>, meta: &Metadata) -> Result<()> {
+        let filename = self.path.join(item);
+
+        if let Some(mode) = meta.mode() {
+            let mode = map_mode_from_go(*mode);
+            std::fs::set_permissions(&filename, fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
     }
 
     pub fn create_file(&self, item: impl AsRef<Path>, size: u64) {
         let filename = self.path.join(item);
         let f = fs::File::create(filename).unwrap();
         f.set_len(size).unwrap();
+    }
+
+    pub fn create_special(&self, item: impl AsRef<Path>, node: &Node) -> Result<()> {
+        let filename = self.path.join(item);
+
+        match node.node_type() {
+            NodeType::Symlink { linktarget } => {
+                symlink(linktarget, filename)?;
+            }
+            NodeType::Dev { device } => {
+                #[cfg(not(target_os = "macos"))]
+                let device = *device;
+                #[cfg(target_os = "macos")]
+                let device = *device as i32;
+                mknod(&filename, SFlag::S_IFBLK, Mode::empty(), device)?;
+            }
+            NodeType::Chardev { device } => {
+                #[cfg(not(target_os = "macos"))]
+                let device = *device;
+                #[cfg(target_os = "macos")]
+                let device = *device as i32;
+                mknod(&filename, SFlag::S_IFCHR, Mode::empty(), device)?;
+            }
+            NodeType::Fifo => {
+                mknod(&filename, SFlag::S_IFIFO, Mode::empty(), 0)?;
+            }
+            NodeType::Socket => {
+                mknod(&filename, SFlag::S_IFSOCK, Mode::empty(), 0)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn write_at(&self, item: impl AsRef<Path>, offset: u64, data: &[u8]) {
