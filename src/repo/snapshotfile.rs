@@ -1,5 +1,6 @@
-use std::cmp::Ordering;
+use std::fmt;
 use std::str::FromStr;
+use std::{cmp::Ordering, fmt::Display};
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Local};
@@ -7,10 +8,10 @@ use clap::Parser;
 use derivative::Derivative;
 use futures::{future, TryStreamExt};
 use indicatif::ProgressBar;
+use log::*;
 use merge::Merge;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
-use vlog::*;
 
 use super::Id;
 use crate::backend::{DecryptReadBackend, FileType, RepoFile};
@@ -129,7 +130,7 @@ impl SnapshotFile {
         predicate: impl FnMut(&Self) -> bool,
         p: ProgressBar,
     ) -> Result<Self> {
-        v1!("getting latest snapshot...");
+        p.set_prefix("getting latest snapshot...");
         let mut latest: Option<Self> = None;
         let mut pred = predicate;
         let mut snaps = be.stream_all::<SnapshotFile>(p.clone()).await?;
@@ -152,7 +153,7 @@ impl SnapshotFile {
 
     /// Get a SnapshotFile from the backend by (part of the) id
     pub async fn from_id<B: DecryptReadBackend>(be: &B, id: &str) -> Result<Self> {
-        v1!("getting snapshot...");
+        info!("getting snapshot...");
         let id = be.find_id(FileType::Snapshot, id).await?;
         SnapshotFile::from_backend(be, &id).await
     }
@@ -366,6 +367,25 @@ pub struct SnapshotGroup {
     tags: Option<StringList>,
 }
 
+impl Display for SnapshotGroup {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut out = Vec::new();
+
+        if let Some(host) = &self.hostname {
+            out.push(format!("host [{host}]"));
+        }
+        if let Some(paths) = &self.paths {
+            out.push(format!("paths [{paths}]"));
+        }
+        if let Some(tags) = &self.tags {
+            out.push(format!("tags [{tags}]"));
+        }
+
+        write!(f, "({})", out.join(", "))?;
+        Ok(())
+    }
+}
+
 impl SnapshotGroup {
     pub fn from_sn(sn: &SnapshotFile, crit: &SnapshotGroupCriterion) -> Self {
         Self {
@@ -387,6 +407,13 @@ impl FromStr for StringList {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         Ok(StringList(s.split(',').map(|s| s.to_string()).collect()))
+    }
+}
+
+impl Display for StringList {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0.join(","))?;
+        Ok(())
     }
 }
 
