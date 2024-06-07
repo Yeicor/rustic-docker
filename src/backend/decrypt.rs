@@ -2,7 +2,7 @@ use std::fs::File;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use futures::{stream::FuturesUnordered, TryStreamExt};
+use futures::{stream, stream::FuturesUnordered, StreamExt};
 use indicatif::ProgressBar;
 use tokio::{spawn, task::JoinHandle};
 use zstd::stream::{copy_encode, decode_all};
@@ -20,6 +20,7 @@ pub trait DecryptReadBackend: ReadBackend {
         &self,
         tpe: FileType,
         id: &Id,
+        cacheable: bool,
         offset: u32,
         length: u32,
     ) -> Result<Vec<u8>>;
@@ -73,36 +74,39 @@ pub trait DecryptWriteBackend: WriteBackend {
 
     async fn save_list<F: RepoFile>(&self, list: Vec<F>, p: ProgressBar) -> Result<()> {
         p.set_length(list.len() as u64);
-        list.into_iter()
-            .map(|file| {
-                let be = self.clone();
-                let p = p.clone();
-                spawn(async move {
-                    be.save_file(&file).await.unwrap();
-                    p.inc(1);
-                })
-            })
-            .collect::<FuturesUnordered<_>>()
-            .try_collect()
-            .await?;
+        stream::iter(list.into_iter().map(|file| {
+            let be = self.clone();
+            let p = p.clone();
+            (file, be, p)
+        }))
+        .for_each_concurrent(5, |(file, be, p)| async move {
+            be.save_file(&file).await.unwrap();
+            p.inc(1);
+        })
+        .await;
         p.finish();
         Ok(())
     }
 
-    async fn delete_list(&self, tpe: FileType, list: Vec<Id>, p: ProgressBar) -> Result<()> {
+    async fn delete_list(
+        &self,
+        tpe: FileType,
+        cacheable: bool,
+        list: Vec<Id>,
+        p: ProgressBar,
+    ) -> Result<()> {
         p.set_length(list.len() as u64);
-        list.into_iter()
-            .map(|id| {
-                let be = self.clone();
-                let p = p.clone();
-                spawn(async move {
-                    be.remove(tpe, &id).await.unwrap();
-                    p.inc(1);
-                })
-            })
-            .collect::<FuturesUnordered<_>>()
-            .try_collect()
-            .await?;
+        stream::iter(list.into_iter().map(|id| {
+            let be = self.clone();
+            let p = p.clone();
+            (id, be, p)
+        }))
+        .for_each_concurrent(20, |(id, be, p)| async move {
+            be.remove(tpe, &id, cacheable).await.unwrap();
+            p.inc(1);
+        })
+        .await;
+
         p.finish();
         Ok(())
     }
@@ -169,32 +173,34 @@ impl<R: ReadBackend, C: CryptoKey> DecryptReadBackend for DecryptBackend<R, C> {
         &self,
         tpe: FileType,
         id: &Id,
+        cacheable: bool,
         offset: u32,
         length: u32,
     ) -> Result<Vec<u8>> {
-        Ok(self
-            .key
-            .decrypt_data(&self.backend.read_partial(tpe, id, offset, length).await?)?)
+        Ok(self.key.decrypt_data(
+            &self
+                .backend
+                .read_partial(tpe, id, cacheable, offset, length)
+                .await?,
+        )?)
     }
 }
 
 #[async_trait]
 impl<R: ReadBackend, C: CryptoKey> ReadBackend for DecryptBackend<R, C> {
-    type Error = R::Error;
-
     fn location(&self) -> &str {
         self.backend.location()
     }
 
-    async fn list(&self, tpe: FileType) -> Result<Vec<Id>, Self::Error> {
+    async fn list(&self, tpe: FileType) -> Result<Vec<Id>> {
         self.backend.list(tpe).await
     }
 
-    async fn list_with_size(&self, tpe: FileType) -> Result<Vec<(Id, u32)>, Self::Error> {
+    async fn list_with_size(&self, tpe: FileType) -> Result<Vec<(Id, u32)>> {
         self.backend.list_with_size(tpe).await
     }
 
-    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Vec<u8>, Self::Error> {
+    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Vec<u8>> {
         self.backend.read_full(tpe, id).await
     }
 
@@ -202,32 +208,31 @@ impl<R: ReadBackend, C: CryptoKey> ReadBackend for DecryptBackend<R, C> {
         &self,
         tpe: FileType,
         id: &Id,
+        cacheable: bool,
         offset: u32,
         length: u32,
-    ) -> Result<Vec<u8>, Self::Error> {
-        self.backend.read_partial(tpe, id, offset, length).await
+    ) -> Result<Vec<u8>> {
+        self.backend
+            .read_partial(tpe, id, cacheable, offset, length)
+            .await
     }
 }
 
 #[async_trait]
 impl<R: WriteBackend, C: CryptoKey> WriteBackend for DecryptBackend<R, C> {
-    async fn create(&self) -> Result<(), Self::Error> {
-        self.backend.create().await?;
-        Ok(())
+    async fn create(&self) -> Result<()> {
+        self.backend.create().await
     }
 
-    async fn write_file(&self, tpe: FileType, id: &Id, f: File) -> Result<(), Self::Error> {
-        self.backend.write_file(tpe, id, f).await?;
-        Ok(())
+    async fn write_file(&self, tpe: FileType, id: &Id, cacheable: bool, f: File) -> Result<()> {
+        self.backend.write_file(tpe, id, cacheable, f).await
     }
 
-    async fn write_bytes(&self, tpe: FileType, id: &Id, buf: Vec<u8>) -> Result<(), Self::Error> {
-        self.backend.write_bytes(tpe, id, buf).await?;
-        Ok(())
+    async fn write_bytes(&self, tpe: FileType, id: &Id, buf: Vec<u8>) -> Result<()> {
+        self.backend.write_bytes(tpe, id, buf).await
     }
 
-    async fn remove(&self, tpe: FileType, id: &Id) -> Result<(), Self::Error> {
-        self.backend.remove(tpe, id).await?;
-        Ok(())
+    async fn remove(&self, tpe: FileType, id: &Id, cacheable: bool) -> Result<()> {
+        self.backend.remove(tpe, id, cacheable).await
     }
 }
