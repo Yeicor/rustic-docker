@@ -30,6 +30,7 @@ mod key;
 mod list;
 mod ls;
 mod prune;
+mod repair;
 mod repoinfo;
 mod restore;
 mod rustic_config;
@@ -42,7 +43,7 @@ use log::*;
 use rustic_config::RusticConfig;
 
 #[derive(Parser)]
-#[clap(about, version)]
+#[clap(about, name="rustic", version = option_env!("PROJECT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
 struct Opts {
     #[clap(flatten, help_heading = "GLOBAL OPTIONS")]
     global: GlobalOpts,
@@ -141,6 +142,8 @@ enum Command {
     Check(check::Opts),
 
     /// Compare two snapshots/paths
+    ///
+    /// Note that the exclude options only apply for comparison with a local path
     Diff(diff::Opts),
 
     /// Remove snapshots from the repository
@@ -170,6 +173,9 @@ enum Command {
     /// Restore a snapshot/path
     Restore(restore::Opts),
 
+    /// Restore a snapshot/path
+    Repair(repair::Opts),
+
     /// Show general information about the repository
     Repoinfo(repoinfo::Opts),
 
@@ -177,7 +183,7 @@ enum Command {
     Tag(tag::Opts),
 }
 
-pub async fn execute() -> Result<()> {
+pub fn execute() -> Result<()> {
     let command: Vec<_> = std::env::args_os().into_iter().collect();
     let args = Opts::parse_from(&command);
 
@@ -216,7 +222,7 @@ pub async fn execute() -> Result<()> {
     }
 
     if let Command::SelfUpdate(opts) = args.command {
-        self_update::execute(opts).await?;
+        self_update::execute(opts)?;
         return Ok(());
     }
 
@@ -259,29 +265,27 @@ pub async fn execute() -> Result<()> {
         (None, None, None) => None,
     };
 
-    let config_ids = be.list(FileType::Config).await?;
+    let config_ids = be.list(FileType::Config)?;
 
     let (cmd, key, dbe, cache, be, be_hot, config) = match (args.command, config_ids.len()) {
-        (Command::Init(opts), _) => {
-            return init::execute(&be, &be_hot, opts, password, config_ids).await
-        }
+        (Command::Init(opts), _) => return init::execute(&be, &be_hot, opts, password, config_ids),
         (cmd, 1) => {
             let be = HotColdBackend::new(be, be_hot.clone());
             if let Some(be_hot) = &be_hot {
-                let mut keys = be.list_with_size(FileType::Key).await?;
+                let mut keys = be.list_with_size(FileType::Key)?;
                 keys.sort_unstable_by_key(|key| key.0);
-                let mut hot_keys = be_hot.list_with_size(FileType::Key).await?;
+                let mut hot_keys = be_hot.list_with_size(FileType::Key)?;
                 hot_keys.sort_unstable_by_key(|key| key.0);
                 if keys != hot_keys {
                     bail!("keys from repo and repo-hot do not match. Aborting.");
                 }
             }
 
-            let key = get_key(&be, password).await?;
+            let key = get_key(&be, password)?;
             info!("password is correct.");
 
             let dbe = DecryptBackend::new(&be, key.clone());
-            let config: ConfigFile = dbe.get_file(&config_ids[0]).await?;
+            let config: ConfigFile = dbe.get_file(&config_ids[0])?;
             match (config.is_hot == Some(true), be_hot.is_some()) {
                 (true, false) => bail!("repository is a hot repository!\nPlease use as --repo-hot in combination with the normal repo. Aborting."),
                 (false, true) => bail!("repo-hot is not a hot repository! Aborting."),
@@ -303,23 +307,24 @@ pub async fn execute() -> Result<()> {
     };
 
     match cmd {
-        Command::Backup(opts) => backup::execute(&dbe, opts, config, config_file, command).await?,
-        Command::Config(opts) => config::execute(&dbe, &be_hot, opts, config).await?,
-        Command::Cat(opts) => cat::execute(&dbe, opts).await?,
-        Command::Check(opts) => check::execute(&dbe, &cache, &be_hot, &be, opts).await?,
+        Command::Backup(opts) => backup::execute(&dbe, opts, config, config_file, command)?,
+        Command::Config(opts) => config::execute(&dbe, &be_hot, opts, config)?,
+        Command::Cat(opts) => cat::execute(&dbe, opts, config_file)?,
+        Command::Check(opts) => check::execute(&dbe, &cache, &be_hot, &be, opts)?,
         Command::Completions(_) => {} // already handled above
-        Command::Diff(opts) => diff::execute(&dbe, opts).await?,
-        Command::Forget(opts) => forget::execute(&dbe, cache, opts, config, config_file).await?,
+        Command::Diff(opts) => diff::execute(&dbe, opts, config_file)?,
+        Command::Forget(opts) => forget::execute(&dbe, cache, opts, config, config_file)?,
         Command::Init(_) => {} // already handled above
-        Command::Key(opts) => key::execute(&dbe, key, opts).await?,
-        Command::List(opts) => list::execute(&dbe, opts).await?,
-        Command::Ls(opts) => ls::execute(&dbe, opts).await?,
+        Command::Key(opts) => key::execute(&dbe, key, opts)?,
+        Command::List(opts) => list::execute(&dbe, opts)?,
+        Command::Ls(opts) => ls::execute(&dbe, opts, config_file)?,
         Command::SelfUpdate(_) => {} // already handled above
-        Command::Snapshots(opts) => snapshots::execute(&dbe, opts, config_file).await?,
-        Command::Prune(opts) => prune::execute(&dbe, cache, opts, config, vec![]).await?,
-        Command::Restore(opts) => restore::execute(&dbe, opts).await?,
-        Command::Repoinfo(opts) => repoinfo::execute(&dbe, &be_hot, opts).await?,
-        Command::Tag(opts) => tag::execute(&dbe, opts, config_file).await?,
+        Command::Snapshots(opts) => snapshots::execute(&dbe, opts, config_file)?,
+        Command::Prune(opts) => prune::execute(&dbe, cache, opts, config, vec![])?,
+        Command::Restore(opts) => restore::execute(&dbe, opts, config_file)?,
+        Command::Repair(opts) => repair::execute(&dbe, opts, config_file, &config)?,
+        Command::Repoinfo(opts) => repoinfo::execute(&dbe, &be_hot, opts)?,
+        Command::Tag(opts) => tag::execute(&dbe, opts, config_file)?,
     };
 
     Ok(())

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use bytesize::ByteSize;
-use chrono::{TimeZone, Utc};
+use chrono::{Local, TimeZone, Utc};
 use clap::Parser;
 use ignore::{overrides::OverrideBuilder, DirEntry, Walk, WalkBuilder};
 use log::*;
@@ -19,6 +19,7 @@ pub struct LocalSource {
     builder: WalkBuilder,
     walker: Walk,
     with_atime: bool,
+    ignore_devid: bool,
     cache: UsersCache,
 }
 
@@ -30,6 +31,11 @@ pub struct LocalSourceOptions {
     #[clap(long)]
     #[merge(strategy = merge::bool::overwrite_false)]
     with_atime: bool,
+
+    /// Don't save device ID for files and directories
+    #[clap(long)]
+    #[merge(strategy = merge::bool::overwrite_false)]
+    ignore_devid: bool,
 
     /// Glob pattern to exclude/include (can be specified multiple times)
     #[clap(long, short = 'g', help_heading = "EXCLUDE OPTIONS")]
@@ -129,16 +135,15 @@ impl LocalSource {
             });
         }
 
-        let with_atime = opts.with_atime;
-        let cache = UsersCache::new();
         let builder = walk_builder;
         let walker = builder.build();
 
         Ok(Self {
             builder,
             walker,
-            with_atime,
-            cache,
+            with_atime: opts.with_atime,
+            ignore_devid: opts.ignore_devid,
+            cache: UsersCache::new(),
         })
     }
 }
@@ -165,14 +170,24 @@ impl Iterator for LocalSource {
     type Item = Result<(PathBuf, Node)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.walker
-            .next()
-            .map(|e| map_entry(e?, self.with_atime, &self.cache))
+        match self.walker.next() {
+            // ignore root dir, i.e. an entry with depth 0 of type dir
+            Some(Ok(entry)) if entry.depth() == 0 && entry.file_type().unwrap().is_dir() => {
+                self.walker.next()
+            }
+            item => item,
+        }
+        .map(|e| map_entry(e?, self.with_atime, self.ignore_devid, &self.cache))
     }
 }
 
 // map_entry: turn entry into (Path, Node)
-fn map_entry(entry: DirEntry, with_atime: bool, cache: &UsersCache) -> Result<(PathBuf, Node)> {
+fn map_entry(
+    entry: DirEntry,
+    with_atime: bool,
+    ignore_devid: bool,
+    cache: &UsersCache,
+) -> Result<(PathBuf, Node)> {
     let name = entry.file_name();
     let m = entry.metadata()?;
 
@@ -185,18 +200,26 @@ fn map_entry(entry: DirEntry, with_atime: bool, cache: &UsersCache) -> Result<(P
         .get_group_by_gid(gid)
         .map(|g| g.name().to_str().unwrap().to_string());
 
-    let mtime = Some(Utc.timestamp(m.mtime(), m.mtime_nsec().try_into()?).into());
+    let mtime = Utc
+        .timestamp_opt(m.mtime(), m.mtime_nsec().try_into()?)
+        .single()
+        .map(|dt| dt.with_timezone(&Local));
     let atime = if with_atime {
-        Some(Utc.timestamp(m.atime(), m.atime_nsec().try_into()?).into())
+        Utc.timestamp_opt(m.atime(), m.atime_nsec().try_into()?)
+            .single()
+            .map(|dt| dt.with_timezone(&Local))
     } else {
         // TODO: Use None here?
         mtime
     };
-    let ctime = Some(Utc.timestamp(m.ctime(), m.ctime_nsec().try_into()?).into());
+    let ctime = Utc
+        .timestamp_opt(m.ctime(), m.ctime_nsec().try_into()?)
+        .single()
+        .map(|dt| dt.with_timezone(&Local));
     let size = if m.is_dir() { 0 } else { m.len() };
     let mode = map_mode_to_go(m.mode());
     let inode = m.ino();
-    let device_id = m.dev();
+    let device_id = if ignore_devid { 0 } else { m.dev() };
     let links = if m.is_dir() { 0 } else { m.nlink() };
 
     let meta = Metadata {

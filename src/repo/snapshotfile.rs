@@ -6,7 +6,6 @@ use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
 use derivative::Derivative;
-use futures::{future, TryStreamExt};
 use indicatif::ProgressBar;
 use log::*;
 use merge::Merge;
@@ -64,14 +63,21 @@ impl DeleteOption {
     }
 }
 
+#[serde_with::apply(Option => #[serde(default, skip_serializing_if = "Option::is_none")])]
 #[derive(Debug, Clone, Serialize, Deserialize, Derivative)]
 #[derivative(Default)]
 pub struct SnapshotFile {
     #[derivative(Default(value = "Local::now()"))]
     pub time: DateTime<Local>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[derivative(Default(
+        value = "\"rustic \".to_string() + option_env!(\"PROJECT_VERSION\").unwrap_or(env!(\"CARGO_PKG_VERSION\"))"
+    ))]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub program_version: String,
     pub parent: Option<Id>,
     pub tree: Id,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
     pub paths: StringList,
     #[serde(default)]
     pub hostname: String,
@@ -83,13 +89,12 @@ pub struct SnapshotFile {
     pub gid: u32,
     #[serde(default)]
     pub tags: StringList,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original: Option<Id>,
     #[serde(default, skip_serializing_if = "DeleteOption::is_not_set")]
     pub delete: DeleteOption,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<SnapshotSummary>,
+    pub description: Option<String>,
 
     #[serde(default, skip_serializing_if = "Id::is_null")]
     pub id: Id,
@@ -108,37 +113,37 @@ impl SnapshotFile {
     }
 
     /// Get a SnapshotFile from the backend
-    pub async fn from_backend<B: DecryptReadBackend>(be: &B, id: &Id) -> Result<Self> {
-        Ok(Self::set_id((*id, be.get_file(id).await?)))
+    pub fn from_backend<B: DecryptReadBackend>(be: &B, id: &Id) -> Result<Self> {
+        Ok(Self::set_id((*id, be.get_file(id)?)))
     }
 
-    pub async fn from_str<B: DecryptReadBackend>(
+    pub fn from_str<B: DecryptReadBackend>(
         be: &B,
         string: &str,
-        predicate: impl FnMut(&Self) -> bool,
+        predicate: impl FnMut(&Self) -> bool + Send + Sync,
         p: ProgressBar,
     ) -> Result<Self> {
         match string {
-            "latest" => Self::latest(be, predicate, p).await,
-            _ => Self::from_id(be, string).await,
+            "latest" => Self::latest(be, predicate, p),
+            _ => Self::from_id(be, string),
         }
     }
 
     /// Get the latest SnapshotFile from the backend
-    pub async fn latest<B: DecryptReadBackend>(
+    pub fn latest<B: DecryptReadBackend>(
         be: &B,
-        predicate: impl FnMut(&Self) -> bool,
+        predicate: impl FnMut(&Self) -> bool + Send + Sync,
         p: ProgressBar,
     ) -> Result<Self> {
         p.set_prefix("getting latest snapshot...");
         let mut latest: Option<Self> = None;
         let mut pred = predicate;
-        let mut snaps = be.stream_all::<SnapshotFile>(p.clone()).await?;
 
-        while let Some((id, mut snap)) = snaps.try_next().await? {
+        for (id, mut snap) in be.stream_all::<SnapshotFile>(p.clone())? {
             if !pred(&snap) {
                 continue;
             }
+
             snap.id = id;
             match &latest {
                 Some(l) if l.time > snap.time => {}
@@ -152,21 +157,20 @@ impl SnapshotFile {
     }
 
     /// Get a SnapshotFile from the backend by (part of the) id
-    pub async fn from_id<B: DecryptReadBackend>(be: &B, id: &str) -> Result<Self> {
+    pub fn from_id<B: DecryptReadBackend>(be: &B, id: &str) -> Result<Self> {
         info!("getting snapshot...");
-        let id = be.find_id(FileType::Snapshot, id).await?;
-        SnapshotFile::from_backend(be, &id).await
+        let id = be.find_id(FileType::Snapshot, id)?;
+        SnapshotFile::from_backend(be, &id)
     }
 
     /// Get a Vector of SnapshotFile from the backend by list of (parts of the) ids
-    pub async fn from_ids<B: DecryptReadBackend>(be: &B, ids: &[String]) -> Result<Vec<Self>> {
-        let ids = be.find_ids(FileType::Snapshot, ids).await?;
+    pub fn from_ids<B: DecryptReadBackend>(be: &B, ids: &[String]) -> Result<Vec<Self>> {
+        let ids = be.find_ids(FileType::Snapshot, ids)?;
         Ok(be
-            .stream_list::<Self>(ids, ProgressBar::hidden())
-            .await?
-            .map_ok(Self::set_id)
-            .try_collect()
-            .await?)
+            .stream_list::<Self>(ids, ProgressBar::hidden())?
+            .into_iter()
+            .map(Self::set_id)
+            .collect())
     }
 
     fn cmp_group(&self, crit: &SnapshotGroupCriterion, other: &Self) -> Ordering {
@@ -174,6 +178,10 @@ impl SnapshotFile {
             false => Ordering::Equal,
             true => self.hostname.cmp(&other.hostname),
         }
+        .then_with(|| match crit.label {
+            false => Ordering::Equal,
+            true => self.label.cmp(&other.label),
+        })
         .then_with(|| match crit.paths {
             false => Ordering::Equal,
             true => self.paths.cmp(&other.paths),
@@ -184,9 +192,12 @@ impl SnapshotFile {
         })
     }
 
-    fn has_group(&self, group: &SnapshotGroup) -> bool {
+    pub fn has_group(&self, group: &SnapshotGroup) -> bool {
         (match &group.hostname {
             Some(val) => val == &self.hostname,
+            None => true,
+        }) && (match &group.label {
+            Some(val) => val == &self.label,
             None => true,
         }) && (match &group.paths {
             Some(val) => val == &self.paths,
@@ -199,12 +210,12 @@ impl SnapshotFile {
 
     /// Get SnapshotFiles which match the filter grouped by the group criterion
     /// from the backend
-    pub async fn group_from_backend<B: DecryptReadBackend>(
+    pub fn group_from_backend<B: DecryptReadBackend>(
         be: &B,
         filter: &SnapshotFilter,
         crit: &SnapshotGroupCriterion,
     ) -> Result<Vec<(SnapshotGroup, Vec<Self>)>> {
-        let mut snaps = Self::all_from_backend(be, filter).await?;
+        let mut snaps = Self::all_from_backend(be, filter)?;
         snaps.sort_unstable_by(|sn1, sn2| sn1.cmp_group(crit, sn2));
 
         let mut result = Vec::new();
@@ -233,23 +244,23 @@ impl SnapshotFile {
         Ok(result)
     }
 
-    pub async fn all_from_backend<B: DecryptReadBackend>(
+    pub fn all_from_backend<B: DecryptReadBackend>(
         be: &B,
         filter: &SnapshotFilter,
     ) -> Result<Vec<Self>> {
         Ok(be
-            .stream_all::<SnapshotFile>(ProgressBar::hidden())
-            .await?
-            .map_ok(Self::set_id)
-            .try_filter(|sn| future::ready(sn.matches(filter)))
-            .try_collect()
-            .await?)
+            .stream_all::<SnapshotFile>(ProgressBar::hidden())?
+            .into_iter()
+            .map(Self::set_id)
+            .filter(|sn| sn.matches(filter))
+            .collect())
     }
 
     pub fn matches(&self, filter: &SnapshotFilter) -> bool {
         self.paths.matches(&filter.filter_paths)
             && self.tags.matches(&filter.filter_tags)
             && (filter.filter_host.is_empty() || filter.filter_host.contains(&self.hostname))
+            && (filter.filter_label.is_empty() || filter.filter_label.contains(&self.label))
     }
 
     /// Add tag lists to snapshot. return wheter snapshot was changed
@@ -315,6 +326,16 @@ impl Ord for SnapshotFile {
 #[derive(Default, Parser, Deserialize, Merge)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct SnapshotFilter {
+    /// Hostname to filter (can be specified multiple times)
+    #[clap(long, value_name = "HOSTNAME")]
+    #[merge(strategy=merge::vec::overwrite_empty)]
+    filter_host: Vec<String>,
+
+    /// Label to filter (can be specified multiple times)
+    #[clap(long, value_name = "LABEL")]
+    #[merge(strategy=merge::vec::overwrite_empty)]
+    filter_label: Vec<String>,
+
     /// Path list to filter (can be specified multiple times)
     #[clap(long, value_name = "PATH[,PATH,..]")]
     #[serde_as(as = "Vec<DisplayFromStr>")]
@@ -326,16 +347,12 @@ pub struct SnapshotFilter {
     #[serde_as(as = "Vec<DisplayFromStr>")]
     #[merge(strategy=merge::vec::overwrite_empty)]
     filter_tags: Vec<StringList>,
-
-    /// Hostname to filter (can be specified multiple times)
-    #[clap(long, value_name = "HOSTNAME")]
-    #[merge(strategy=merge::vec::overwrite_empty)]
-    filter_host: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Deserialize)]
 pub struct SnapshotGroupCriterion {
     hostname: bool,
+    label: bool,
     paths: bool,
     tags: bool,
 }
@@ -347,6 +364,7 @@ impl FromStr for SnapshotGroupCriterion {
         for val in s.split(',') {
             match val {
                 "host" => crit.hostname = true,
+                "label" => crit.label = true,
                 "paths" => crit.paths = true,
                 "tags" => crit.tags = true,
                 "" => continue,
@@ -357,13 +375,12 @@ impl FromStr for SnapshotGroupCriterion {
     }
 }
 
-#[derive(Default, Debug, Serialize)]
+#[serde_with::apply(Option => #[serde(default, skip_serializing_if = "Option::is_none")])]
+#[derive(Default, Debug, PartialEq, Eq, Serialize)]
 pub struct SnapshotGroup {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     hostname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     paths: Option<StringList>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     tags: Option<StringList>,
 }
 
@@ -373,6 +390,9 @@ impl Display for SnapshotGroup {
 
         if let Some(host) = &self.hostname {
             out.push(format!("host [{host}]"));
+        }
+        if let Some(label) = &self.label {
+            out.push(format!("label [{label}]"));
         }
         if let Some(paths) = &self.paths {
             out.push(format!("paths [{paths}]"));
@@ -390,13 +410,14 @@ impl SnapshotGroup {
     pub fn from_sn(sn: &SnapshotFile, crit: &SnapshotGroupCriterion) -> Self {
         Self {
             hostname: crit.hostname.then(|| sn.hostname.clone()),
+            label: crit.label.then(|| sn.label.clone()),
             paths: crit.paths.then(|| sn.paths.clone()),
             tags: crit.tags.then(|| sn.tags.clone()),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hostname.is_none() && self.paths.is_none() && self.tags.is_none()
+        self == &Self::default()
     }
 }
 
@@ -458,9 +479,6 @@ impl StringList {
     }
 
     pub fn formatln(&self) -> String {
-        self.0
-            .iter()
-            .map(|p| p.to_string() + "\n")
-            .collect::<String>()
+        self.0.join("\n")
     }
 }

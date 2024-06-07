@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::{anyhow, Result};
 use chrono::{Duration, Local};
@@ -6,7 +7,7 @@ use clap::{AppSettings, Parser};
 use gethostname::gethostname;
 use log::*;
 use merge::Merge;
-use path_absolutize::*;
+use path_dedot::ParseDot;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
 
@@ -18,7 +19,10 @@ use crate::backend::{
 };
 use crate::blob::{Metadata, Node, NodeType};
 use crate::index::IndexBackend;
-use crate::repo::{ConfigFile, DeleteOption, SnapshotFile, SnapshotSummary, StringList};
+use crate::repo::{
+    ConfigFile, DeleteOption, SnapshotFile, SnapshotGroup, SnapshotGroupCriterion, SnapshotSummary,
+    StringList,
+};
 
 #[serde_as]
 #[derive(Clone, Default, Parser, Deserialize, Merge)]
@@ -29,6 +33,10 @@ pub(super) struct Opts {
     #[clap(long, short = 'n')]
     #[merge(strategy = merge::bool::overwrite_false)]
     dry_run: bool,
+
+    /// Group snapshots by any combination of host,label,paths,tags to find a suitable parent (default: host,paths)
+    #[clap(long, short = 'g', value_name = "CRITERION")]
+    group_by: Option<SnapshotGroupCriterion>,
 
     /// Snapshot to use as parent
     #[clap(long, value_name = "SNAPSHOT", conflicts_with = "force")]
@@ -49,11 +57,23 @@ pub(super) struct Opts {
     #[merge(strategy = merge::bool::overwrite_false)]
     ignore_inode: bool,
 
+    /// Label snapshot with given label
+    #[clap(long, value_name = "LABEL")]
+    label: Option<String>,
+
     /// Tags to add to backup (can be specified multiple times)
     #[clap(long, value_name = "TAG[,TAG,..]")]
     #[serde_as(as = "Vec<DisplayFromStr>")]
     #[merge(strategy = merge::vec::overwrite_empty)]
     tag: Vec<StringList>,
+
+    /// Add description to snapshot
+    #[clap(long, value_name = "DESCRIPTION")]
+    description: Option<String>,
+
+    /// Add description to snapshot from file
+    #[clap(long, value_name = "FILE", conflicts_with = "description")]
+    description_from: Option<PathBuf>,
 
     /// Mark snapshot as uneraseable
     #[clap(long, conflicts_with = "delete-after")]
@@ -69,6 +89,10 @@ pub(super) struct Opts {
     #[clap(long, value_name = "FILENAME", default_value = "stdin")]
     #[merge(skip)]
     stdin_filename: String,
+
+    /// Manually set backup path in snapshot
+    #[clap(long, value_name = "PATH")]
+    as_path: Option<PathBuf>,
 
     /// Set the host name manually
     #[clap(long, value_name = "NAME")]
@@ -91,7 +115,7 @@ pub(super) struct Opts {
     source: String,
 }
 
-pub(super) async fn execute(
+pub(super) fn execute(
     be: &impl DecryptFullBackend,
     opts: Opts,
     config: ConfigFile,
@@ -116,14 +140,24 @@ pub(super) async fn execute(
         }
     };
 
-    let index = IndexBackend::only_full_trees(&be.clone(), progress_counter("")).await?;
+    let index = IndexBackend::only_full_trees(&be.clone(), progress_counter(""))?;
 
     for source in sources {
         let mut opts = opts.clone();
 
         // merge Options from config file, if given
         if let Some(idx) = config_opts.iter().position(|opt| opt.source == *source) {
+            info!("merging source=\"{source}\" section from config file");
             opts.merge(config_opts.remove(idx));
+        }
+        // merge Options from config file using as_path, if given
+        if let Some(path) = &opts.as_path {
+            if let Some(path) = path.as_os_str().to_str() {
+                if let Some(idx) = config_opts.iter().position(|opt| opt.source == path) {
+                    info!("merging source=\"{path}\" section from config file");
+                    opts.merge(config_opts.remove(idx));
+                }
+            }
         }
         // merge "backup" section from config file, if given
         config_file.merge_into("backup", &mut opts)?;
@@ -136,11 +170,16 @@ pub(super) async fn execute(
         let backup_path = if backup_stdin {
             PathBuf::from(&opts.stdin_filename)
         } else {
-            PathBuf::from(&source).absolutize()?.to_path_buf()
+            PathBuf::from(&source).parse_dot()?.to_path_buf()
         };
-        let backup_path_str = backup_path
+        let as_path = match opts.as_path {
+            None => None,
+            Some(p) => Some(p.parse_dot()?.to_path_buf()),
+        };
+        let backup_path_str = as_path.as_ref().unwrap_or(&backup_path);
+        let backup_path_str = backup_path_str
             .to_str()
-            .ok_or_else(|| anyhow!("non-unicode path {:?}", backup_path))?
+            .ok_or_else(|| anyhow!("non-unicode path {:?}", backup_path_str))?
             .to_string();
 
         let hostname = match opts.host {
@@ -154,29 +193,6 @@ pub(super) async fn execute(
             }
         };
 
-        let parent = match (backup_stdin, opts.force, opts.parent.clone()) {
-            (true, _, _) | (false, true, _) => None,
-            (false, false, None) => SnapshotFile::latest(
-                &be,
-                |snap| snap.hostname == hostname && snap.paths.contains(&backup_path_str),
-                progress_counter(""),
-            )
-            .await
-            .ok(),
-            (false, false, Some(parent)) => SnapshotFile::from_id(&be, &parent).await.ok(),
-        };
-
-        let parent_tree = match &parent {
-            Some(snap) => {
-                info!("using parent {}", snap.id);
-                Some(snap.tree)
-            }
-            None => {
-                info!("using no parent");
-                None
-            }
-        };
-
         let delete = match (opts.delete_never, opts.delete_after) {
             (true, _) => DeleteOption::Never,
             (_, Some(d)) => DeleteOption::After(time + Duration::from_std(*d)?),
@@ -185,42 +201,75 @@ pub(super) async fn execute(
 
         let mut snap = SnapshotFile {
             time,
-            parent: parent.map(|sn| sn.id),
             hostname,
+            label: opts.label.unwrap_or_default(),
             delete,
             summary: Some(SnapshotSummary {
                 command: command.clone(),
                 ..Default::default()
             }),
+            description: opts.description,
             ..Default::default()
         };
+
+        // use description from description file if it is given
+        if let Some(file) = opts.description_from {
+            snap.description = Some(std::fs::read_to_string(file)?);
+        }
+
         snap.paths.add(backup_path_str.clone());
         snap.set_tags(opts.tag.clone());
 
-        let parent = Parent::new(&index, parent_tree, opts.ignore_ctime, opts.ignore_inode).await;
+        // get suitable snapshot group from snapshot and opts.group_by. This is used to filter snapshots for the parent detection
+        let group = SnapshotGroup::from_sn(
+            &snap,
+            &opts
+                .group_by
+                .unwrap_or_else(|| SnapshotGroupCriterion::from_str("host,paths").unwrap()),
+        );
+
+        let parent = match (backup_stdin, opts.force, opts.parent.clone()) {
+            (true, _, _) | (false, true, _) => None,
+            (false, false, None) => {
+                SnapshotFile::latest(&be, |snap| snap.has_group(&group), progress_counter("")).ok()
+            }
+            (false, false, Some(parent)) => SnapshotFile::from_id(&be, &parent).ok(),
+        };
+
+        let parent_tree = match &parent {
+            Some(parent) => {
+                info!("using parent {}", parent.id);
+                snap.parent = Some(parent.id);
+                Some(parent.tree)
+            }
+            None => {
+                info!("using no parent");
+                None
+            }
+        };
+
+        let parent = Parent::new(&index, parent_tree, opts.ignore_ctime, opts.ignore_inode);
 
         let snap = if backup_stdin {
             let mut archiver = Archiver::new(be, index, &config, parent, snap)?;
             let p = progress_bytes("starting backup from stdin...");
-            archiver
-                .backup_reader(
-                    std::io::stdin(),
-                    Node::new(
-                        backup_path_str,
-                        NodeType::File,
-                        Metadata::default(),
-                        None,
-                        None,
-                    ),
-                    p.clone(),
-                )
-                .await?;
+            archiver.backup_reader(
+                std::io::stdin(),
+                Node::new(
+                    backup_path_str,
+                    NodeType::File,
+                    Metadata::default(),
+                    None,
+                    None,
+                ),
+                p.clone(),
+            )?;
 
-            let snap = archiver.finalize_snapshot().await?;
+            let snap = archiver.finalize_snapshot()?;
             p.finish_with_message("done");
             snap
         } else {
-            let src = LocalSource::new(opts.ignore_opts.clone(), backup_path)?;
+            let src = LocalSource::new(opts.ignore_opts.clone(), backup_path.clone())?;
 
             let p = progress_bytes("determining size...");
             if !p.is_hidden() {
@@ -235,13 +284,20 @@ pub(super) async fn execute(
                         warn!("ignoring error {}\n", e)
                     }
                     Ok((path, node)) => {
-                        if let Err(e) = archiver.add_entry(&path, node, p.clone()).await {
+                        let snapshot_path = if let Some(as_path) = &as_path {
+                            as_path
+                                .clone()
+                                .join(path.strip_prefix(&backup_path).unwrap())
+                        } else {
+                            path.clone()
+                        };
+                        if let Err(e) = archiver.add_entry(&snapshot_path, &path, node, p.clone()) {
                             warn!("ignoring error {} for {:?}\n", e, path);
                         }
                     }
                 }
             }
-            let snap = archiver.finalize_snapshot().await?;
+            let snap = archiver.finalize_snapshot()?;
             p.finish_with_message("done");
             snap
         };

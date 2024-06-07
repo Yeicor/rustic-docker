@@ -1,17 +1,19 @@
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::process::Command;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use bytesize::ByteSize;
-use futures::{stream::FuturesUnordered, TryStreamExt};
+use comfy_table::{
+    presets::ASCII_MARKDOWN, Attribute, Cell, CellAlignment, ContentArrangement, Table,
+};
 use indicatif::HumanDuration;
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use log::*;
+use rayon::ThreadPoolBuilder;
 use rpassword::prompt_password;
-use tokio::spawn;
-use tokio::time::sleep;
 
 use crate::backend::{DecryptReadBackend, FileType, ReadBackend};
 use crate::crypto::Key;
@@ -23,16 +25,15 @@ pub fn bytes(b: u64) -> String {
     ByteSize(b).to_string_as(true)
 }
 
-pub async fn get_key(be: &impl ReadBackend, password: Option<String>) -> Result<Key> {
+pub fn get_key(be: &impl ReadBackend, password: Option<String>) -> Result<Key> {
     for _ in 0..MAX_PASSWORD_RETRIES {
         match &password {
             // if password is given, directly return the result of find_key_in_backend and don't retry
-            Some(pass) => return find_key_in_backend(be, pass, None).await,
+            Some(pass) => return find_key_in_backend(be, pass, None),
             None => {
                 // TODO: Differentiate between wrong password and other error!
                 if let Ok(key) =
                     find_key_in_backend(be, &prompt_password("enter repository password: ")?, None)
-                        .await
                 {
                     return Ok(key);
                 }
@@ -42,6 +43,17 @@ pub async fn get_key(be: &impl ReadBackend, password: Option<String>) -> Result<
     bail!("incorrect password!");
 }
 
+fn progress_intervall() -> Duration {
+    let env_name = "RUSTIC_PROGRESS_INTERVAL";
+    std::env::var(env_name)
+        .map(|var| {
+            humantime::Duration::from_str(&var)
+                .expect("{env_name}: please provide a valid duration")
+                .into()
+        })
+        .unwrap_or(Duration::from_millis(100))
+}
+
 pub fn progress_spinner(prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
     let p = ProgressBar::new(0).with_style(
         ProgressStyle::default_bar()
@@ -49,7 +61,7 @@ pub fn progress_spinner(prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
             .unwrap(),
     );
     p.set_prefix(prefix);
-    p.enable_steady_tick(Duration::from_millis(100));
+    p.enable_steady_tick(progress_intervall());
     p
 }
 
@@ -59,8 +71,8 @@ pub fn progress_counter(prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
             .template("[{elapsed_precise}] {prefix:30} {bar:40.cyan/blue} {pos:>10}/{len:10}")
             .unwrap(),
     );
-    p.enable_steady_tick(Duration::from_millis(100));
     p.set_prefix(prefix);
+    p.enable_steady_tick(progress_intervall());
     p
 }
 
@@ -81,11 +93,11 @@ pub fn progress_bytes(prefix: impl Into<Cow<'static, str>>) -> ProgressBar {
             .unwrap()
             );
     p.set_prefix(prefix);
-    p.enable_steady_tick(Duration::from_millis(100));
+    p.enable_steady_tick(progress_intervall());
     p
 }
 
-pub fn warm_up_command(packs: Vec<Id>, command: &str) -> Result<()> {
+pub fn warm_up_command(packs: impl ExactSizeIterator<Item = Id>, command: &str) -> Result<()> {
     let p = progress_counter("warming up packs...");
     p.set_length(packs.len() as u64);
     for pack in packs {
@@ -104,39 +116,70 @@ pub fn warm_up_command(packs: Vec<Id>, command: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn warm_up(be: &impl DecryptReadBackend, packs: Vec<Id>) -> Result<()> {
+pub fn warm_up(
+    be: &impl DecryptReadBackend,
+    packs: impl ExactSizeIterator<Item = Id>,
+) -> Result<()> {
     let mut be = be.clone();
     be.set_option("retry", "false")?;
 
     let p = progress_counter("warming up packs...");
     p.set_length(packs.len() as u64);
-    let mut stream = FuturesUnordered::new();
 
     const MAX_READER: usize = 20;
-    for pack in packs {
-        while stream.len() > MAX_READER {
-            stream.try_next().await?;
+    let pool = ThreadPoolBuilder::new().num_threads(MAX_READER).build()?;
+    let p = &p;
+    let be = &be;
+    pool.in_place_scope(|s| {
+        for pack in packs {
+            s.spawn(move |_| {
+                // ignore errors as they are expected from the warm-up
+                _ = be.read_partial(FileType::Pack, &pack, false, 0, 1);
+                p.inc(1);
+            });
         }
+    });
 
-        let p = p.clone();
-        let be = be.clone();
-        stream.push(spawn(async move {
-            // ignore errors as they are expected from the warm-up
-            _ = be.read_partial(FileType::Pack, &pack, false, 0, 1).await;
-            p.inc(1);
-        }))
-    }
-
-    stream.try_collect().await?;
     p.finish();
 
     Ok(())
 }
 
-pub async fn wait(d: Option<humantime::Duration>) {
+pub fn wait(d: Option<humantime::Duration>) {
     if let Some(wait) = d {
         let p = progress_spinner(format!("waiting {}...", wait));
-        sleep(*wait).await;
+        std::thread::sleep(*wait);
         p.finish();
     }
+}
+
+// Helpers for table output
+
+pub fn bold_cell<T: ToString>(s: T) -> Cell {
+    Cell::new(s).add_attribute(Attribute::Bold)
+}
+
+pub fn table() -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(ASCII_MARKDOWN)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+    table
+}
+
+pub fn table_with_titles<I: IntoIterator<Item = T>, T: ToString>(titles: I) -> Table {
+    let mut table = table();
+    table.set_header(titles.into_iter().map(bold_cell));
+    table
+}
+
+pub fn table_right_from<I: IntoIterator<Item = T>, T: ToString>(start: usize, titles: I) -> Table {
+    let mut table = table_with_titles(titles);
+    // set alignment of all rows except first start row
+    table
+        .column_iter_mut()
+        .skip(start)
+        .for_each(|c| c.set_cell_alignment(CellAlignment::Right));
+
+    table
 }
