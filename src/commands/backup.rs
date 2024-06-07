@@ -13,6 +13,7 @@ use crate::backend::{
     DecryptFullBackend, DecryptWriteBackend, DryRunBackend, LocalSource, LocalSourceOptions,
     ReadSource,
 };
+use crate::id::Id;
 use crate::index::IndexBackend;
 use crate::repo::{ConfigFile, DeleteOption, SnapshotFile, SnapshotSummary, StringList};
 
@@ -52,10 +53,11 @@ pub(super) struct Opts {
 pub(super) async fn execute(
     be: &impl DecryptFullBackend,
     opts: Opts,
-    config: ConfigFile,
+    config_id: &Id,
     command: String,
 ) -> Result<()> {
     let time = Local::now();
+    let config: ConfigFile = be.get_file(config_id).await?;
     let poly = config.poly()?;
     let zstd = match config.version {
         1 => None,

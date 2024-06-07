@@ -4,10 +4,10 @@ use clap::Parser;
 use derivative::Derivative;
 use prettytable::{cell, format, row, Table};
 
-use super::{progress_counter, prune};
+use super::progress_counter;
 use crate::backend::{DecryptFullBackend, FileType};
 use crate::repo::{
-    ConfigFile, SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion, StringList,
+    SnapshotFile, SnapshotFilter, SnapshotGroup, SnapshotGroupCriterion, StringList,
 };
 
 #[derive(Parser)]
@@ -27,27 +27,15 @@ pub(super) struct Opts {
     #[clap(flatten)]
     keep: KeepOptions,
 
-    /// also prune the repository
-    #[clap(long)]
-    prune: bool,
-
-    #[clap(flatten)]
-    prune_opts: prune::Opts,
-
     /// don't remove anything, only show what would be done
-    #[clap(skip)]
+    #[clap(long, short = 'n')]
     dry_run: bool,
 
     /// Snapshots to forget
     ids: Vec<String>,
 }
 
-pub(super) async fn execute(
-    be: &(impl DecryptFullBackend + Unpin),
-    mut opts: Opts,
-    config: ConfigFile,
-) -> Result<()> {
-    opts.dry_run = opts.prune_opts.dry_run;
+pub(super) async fn execute(be: &impl DecryptFullBackend, opts: Opts) -> Result<()> {
     let groups = match opts.ids.is_empty() {
         true => SnapshotFile::group_from_backend(be, &opts.filter, &opts.group_by).await?,
         false => vec![(
@@ -116,14 +104,12 @@ pub(super) async fn execute(
         ),
         (false, false) => {
             println!("removing snapshots...");
-            be.delete_list(FileType::Snapshot, forget_snaps.clone(), progress_counter())
+            be.delete_list(FileType::Snapshot, forget_snaps, progress_counter())
                 .await?;
         }
     }
 
-    if opts.prune {
-        prune::execute(be, opts.prune_opts, config, forget_snaps).await?;
-    }
+    // TODO: Add option to call prune directly (also for the dry-run case)
 
     Ok(())
 }

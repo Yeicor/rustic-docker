@@ -24,7 +24,6 @@ pub use indexer::*;
 
 #[derive(Debug, Clone, Constructor, Getters)]
 pub struct IndexEntry {
-    blob_type: BlobType,
     pack: Id,
     offset: u32,
     length: u32,
@@ -34,7 +33,6 @@ pub struct IndexEntry {
 impl IndexEntry {
     pub fn from_index_blob(blob: &IndexBlob, pack: Id) -> Self {
         Self {
-            blob_type: blob.tpe,
             pack,
             offset: blob.offset,
             length: blob.length,
@@ -45,13 +43,7 @@ impl IndexEntry {
     /// Get a blob described by IndexEntry from the backend
     pub async fn read_data<B: DecryptReadBackend>(&self, be: &B) -> Result<Vec<u8>> {
         let data = be
-            .read_encrypted_partial(
-                FileType::Pack,
-                &self.pack,
-                self.blob_type.is_cacheable(),
-                self.offset,
-                self.length,
-            )
+            .read_encrypted_partial(FileType::Pack, &self.pack, self.offset, self.length)
             .await?;
         Ok(match self.uncompressed_length {
             None => data,

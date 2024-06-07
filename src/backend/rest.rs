@@ -1,6 +1,5 @@
 use std::fs::File;
 
-use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::{Client, Url};
 use serde::Deserialize;
@@ -16,17 +15,8 @@ pub struct RestBackend {
 
 impl RestBackend {
     pub fn new(url: &str) -> Self {
-        let url = if url.ends_with('/') {
-            Url::parse(url).unwrap()
-        } else {
-            // add a trailing '/' if there is none
-            let mut url = url.to_string();
-            url.push('/');
-            Url::parse(&url).unwrap()
-        };
-
         Self {
-            url,
+            url: Url::parse(url).unwrap(),
             client: Client::new(),
         }
     }
@@ -48,16 +38,18 @@ impl RestBackend {
 
 #[async_trait]
 impl ReadBackend for RestBackend {
+    type Error = reqwest::Error;
+
     fn location(&self) -> &str {
         self.url.as_str()
     }
 
-    async fn list_with_size(&self, tpe: FileType) -> Result<Vec<(Id, u32)>> {
+    async fn list_with_size(&self, tpe: FileType) -> Result<Vec<(Id, u32)>, Self::Error> {
         if tpe == FileType::Config {
             return Ok(
                 match self
                     .client
-                    .head(self.url.join("config").unwrap())
+                    .head(self.url.join("/config").unwrap())
                     .send()
                     .await?
                     .status()
@@ -91,7 +83,7 @@ impl ReadBackend for RestBackend {
         Ok(list.into_iter().map(|i| (i.name, i.size)).collect())
     }
 
-    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Vec<u8>> {
+    async fn read_full(&self, tpe: FileType, id: &Id) -> Result<Vec<u8>, Self::Error> {
         Ok(self
             .client
             .get(self.url(tpe, id))
@@ -107,10 +99,9 @@ impl ReadBackend for RestBackend {
         &self,
         tpe: FileType,
         id: &Id,
-        _cacheable: bool,
         offset: u32,
         length: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, Self::Error> {
         let offset2 = offset + length - 1;
         let header_value = format!("bytes={}-{}", offset, offset2);
         Ok(self
@@ -128,7 +119,7 @@ impl ReadBackend for RestBackend {
 
 #[async_trait]
 impl WriteBackend for RestBackend {
-    async fn create(&self) -> Result<()> {
+    async fn create(&self) -> Result<(), Self::Error> {
         self.client
             .post(self.url.join("?create=true").unwrap())
             .send()
@@ -136,7 +127,7 @@ impl WriteBackend for RestBackend {
         Ok(())
     }
 
-    async fn write_file(&self, tpe: FileType, id: &Id, _cacheable: bool, f: File) -> Result<()> {
+    async fn write_file(&self, tpe: FileType, id: &Id, f: File) -> Result<(), Self::Error> {
         v3!("writing tpe: {:?}, id: {}", &tpe, &id);
         self.client
             .post(self.url(tpe, id))
@@ -146,13 +137,13 @@ impl WriteBackend for RestBackend {
         Ok(())
     }
 
-    async fn write_bytes(&self, tpe: FileType, id: &Id, buf: Vec<u8>) -> Result<()> {
+    async fn write_bytes(&self, tpe: FileType, id: &Id, buf: Vec<u8>) -> Result<(), Self::Error> {
         v3!("writing tpe: {:?}, id: {}", &tpe, &id);
         self.client.post(self.url(tpe, id)).body(buf).send().await?;
         Ok(())
     }
 
-    async fn remove(&self, tpe: FileType, id: &Id) -> Result<()> {
+    async fn remove(&self, tpe: FileType, id: &Id) -> Result<(), Self::Error> {
         v3!("removing tpe: {:?}, id: {}", &tpe, &id);
         self.client.delete(self.url(tpe, id)).send().await?;
         Ok(())
