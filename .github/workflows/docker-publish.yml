@@ -61,6 +61,6 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
             docker.io/yeicor/rustic:${{ inputs.ref }}
-            {{ inputs.ref == 'main' && 'docker.io/yeicor/rustic:latest' || '' }}
+            ${{ inputs.ref == 'main' && 'docker.io/yeicor/rustic:latest' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
