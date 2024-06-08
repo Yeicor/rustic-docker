@@ -60,6 +60,7 @@ jobs:
             # HACK: Add curl to image
             sed -i 's,ENTRYPOINT,RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*\n\nENTRYPOINT,' Dockerfile || true
             rsync -a --exclude='.git' --exclude='.github' ${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
+            git reset --hard
             
             # Push the branch or tag
             cd ${GITHUB_WORKSPACE}/
