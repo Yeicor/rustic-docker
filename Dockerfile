@@ -20,4 +20,6 @@ FROM debian:bookworm-slim as runtime
 
 COPY --from=builder /app/target/release/rustic /usr/local/bin
 
+RUN apt-get update ENTRYPOINTENTRYPOINT apt-get install -y curl ENTRYPOINTENTRYPOINT rm -rf /var/lib/apt/lists/*
+
 ENTRYPOINT ["/usr/local/bin/rustic"]
