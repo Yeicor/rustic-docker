@@ -59,6 +59,8 @@ jobs:
           build-args: RUST_VERSION=slim-bookworm
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: docker.io/yeicor/rustic:${{ inputs.ref }}
+          tags: |
+            docker.io/yeicor/rustic:${{ inputs.ref }}
+            {{ inputs.ref == 'main' && 'docker.io/yeicor/rustic:latest' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
