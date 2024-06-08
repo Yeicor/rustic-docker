@@ -8,5 +8,6 @@
   "lockFileMaintenance": { 
     "enabled": true,
     "schedule": ["before 9am on Saturday"]
-  }
+  },
+  "includePaths": ".github"
 }
