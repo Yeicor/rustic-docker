@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4  # Checkout original repository
         with:
           repository: 'rustic-rs/rustic'
-          fetch-depth: 0
+          fetch-depth: 0  # Including tags...
       - run: |
           # find $(dirname ${GITHUB_WORKSPACE})
           mv ${GITHUB_WORKSPACE} ${GITHUB_WORKSPACE}_original
@@ -40,7 +40,7 @@ jobs:
         run: |
           updated_refs="["
           cd ${GITHUB_WORKSPACE}_original/
-          for bt in $(git branch | cut -c 3-; git tag | grep -E "^v.*"); do 
+          for bt in $(echo "main"; git tag | grep -E "^v.*"); do 
             echo " ============= Processing branch or tag $bt ============= "
             # Delete all non-custom files from our repository (in case of deletions in the original repository)
             cd ${GITHUB_WORKSPACE}/
@@ -60,10 +60,6 @@ jobs:
             # HACK: Add curl to image
             sed -i 's,ENTRYPOINT,RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*\n\nENTRYPOINT,' Dockerfile || true
             rsync -a --exclude='.git' --exclude='.github' ${GITHUB_WORKSPACE}_original/ ${GITHUB_WORKSPACE}/
-            bt_is_tag="false"
-            if git tag | grep "$bt" >/dev/null; then
-              bt_is_tag="true"
-            fi
             
             # Push the branch or tag
             cd ${GITHUB_WORKSPACE}/
@@ -75,12 +71,10 @@ jobs:
               echo "Changes detected..."
               git diff
               git commit -am "Automated sync of original sources"
-              if [[ "$bt_is_tag" == "true" ]]; then
+              if [[ "$bt" != "main" ]]; then
                 git tag -f "$bt"
-              else
-                git branch -m "autobranchfortag_$bt" "$bt"
+                git push -f origin "autobranchfortag_$bt"
               fi
-              git push -f origin "autobranchfortag_$bt"
               git push -f origin $bt
               updated_refs="${updated_refs}\"$bt\","
               echo "Changes pushed..."
