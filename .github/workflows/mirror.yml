@@ -42,6 +42,12 @@ jobs:
           cd ${GITHUB_WORKSPACE}_original/
           for bt in $(echo "main"; git tag | grep -E "^v.*"); do 
             echo " ============= Processing branch or tag $bt ============= "
+            # Skip unsupported branches
+            if [[ "$bt" == "v0.8.1" ]]; then
+              echo "Skipping unsupported branch..."
+              continue
+            fi
+            
             # Delete all non-custom files from our repository (in case of deletions in the original repository)
             cd ${GITHUB_WORKSPACE}/
             if [[ "$bt" == "main" ]]; then
